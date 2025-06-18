@@ -1,0 +1,108 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+build/
+develop-eggs/
+dist/
+downloads/
+eggs/
+.eggs/
+lib/
+lib64/
+parts/
+sdist/
+var/
+wheels/
+share/python-wheels/
+*.egg-info/
+.installed.cfg
+*.egg
+MANIFEST
+
+# PyInstaller
+*.manifest
+*.spec
+
+# Unit test / coverage reports
+htmlcov/
+.tox/
+.nox/
+.coverage
+.coverage.*
+.cache
+nosetests.xml
+coverage.xml
+*.cover
+*.py,cover
+.hypothesis/
+.pytest_cache/
+cover/
+
+# Virtual environments
+venv/
+env/
+ENV/
+env.bak/
+venv.bak/
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+# Environment variables
+.env
+.env.local
+.env.production
+
+# API keys
+*.key
+api_keys.txt
+
+# Data
+data/
+*.csv
+*.parquet
+*.pkl
+*.pickle
+
+# Logs
+*.log
+logs/
+
+# Model outputs
+models/
+checkpoints/
+
+# CAAFE specific
+caafe_env/
+manifest_*.json
+results_*.json
+features_*.csv
+cache/
+.cache/
+
+# Temporary test files
+test_*.py
+debug_*.py
+scratch/
+!test_basic.py
+
+# Generated outputs
+generated_features/
+output/
+
+# Experiment artifacts
+experiments/output/
+experiments/cache/
