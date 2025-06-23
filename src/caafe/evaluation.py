@@ -160,41 +160,18 @@ def execute_and_evaluate_code_block(
     
     return None, new_rocs, new_accs, old_rocs, old_accs
 
-def execute_code_safely(code: str, df: pd.DataFrame) -> pd.DataFrame:
+def execute_code_safely(code: str, df: pd.DataFrame, target_column=None) -> pd.DataFrame:
     """
-    Safely execute code on a dataframe.
+    Legacy wrapper - imports the secure version from core to avoid duplication.
     
     Args:
         code: Python code to execute
         df: Dataframe to execute on
+        target_column: Target column name (ignored in legacy mode)
         
     Returns:
         Modified dataframe
     """
-    if not code.strip():
-        return df
-    
-    # Create safe execution environment
-    local_vars = {
-        'df': df.copy(),
-        'pd': pd,
-        'np': np
-    }
-    
-    # Execute code with safe built-ins
-    safe_builtins = {
-        'int': int,
-        'float': float,
-        'str': str,
-        'bool': bool,
-        'len': len,
-        'range': range,
-        'abs': abs,
-        'max': max,
-        'min': min,
-        'sum': sum,
-        'round': round,
-    }
-    exec(code, {"__builtins__": safe_builtins, "pd": pd, "np": np}, local_vars)
-    
-    return local_vars['df']
+    # Import here to avoid circular imports
+    from .core import execute_code_safely as secure_execute
+    return secure_execute(code, df, target_column)

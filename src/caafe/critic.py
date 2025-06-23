@@ -92,7 +92,7 @@ class Critic:
             colsample_bytree=0.80,
             objective="binary:logistic", 
             eval_metric="auc",
-            n_jobs=4, 
+            n_jobs=self.n_jobs,  # Use the parameter instead of hardcoded value
             random_state=42
         )
         print(f"✅ XGBoost critic ready (CPU hist) — folds={self.folds}, jobs={self.n_jobs}")

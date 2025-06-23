@@ -6,9 +6,12 @@ Clean implementation following original methodology.
 import pandas as pd
 import numpy as np
 import openai
+import ollama
 import os
+import ast
 from sklearn.model_selection import RepeatedKFold
 from .evaluation import evaluate_dataset
+from .critic import Critic
 from typing import Optional
 from dotenv import load_dotenv
 
@@ -16,35 +19,102 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def check_ast(node):
+    """
+    Security validation for AST nodes to prevent dangerous operations.
+    Based on CodeB's check_ast() implementation.
+    """
+    # Allowed node types for safe pandas/numpy operations
+    ALLOWED_NODES = {
+        ast.Module, ast.Expr, ast.Assign, ast.AugAssign, ast.Name, ast.Load, ast.Store,
+        ast.Attribute, ast.Subscript, ast.Index, ast.Slice, ast.Call, ast.keyword,
+        ast.BinOp, ast.UnaryOp, ast.Compare, ast.BoolOp, ast.IfExp,
+        ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.FloorDiv,
+        ast.And, ast.Or, ast.Not, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
+        ast.Is, ast.IsNot, ast.In, ast.NotIn,
+        ast.Constant, ast.Num, ast.Str, ast.NameConstant,  # Literals
+        ast.List, ast.Tuple, ast.Dict, ast.Set,  # Containers
+        ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp,  # Comprehensions
+        ast.Lambda, ast.arguments, ast.arg,  # Lambda functions and arguments for pandas operations
+    }
+    
+    # Forbidden imports and operations
+    FORBIDDEN_NAMES = {
+        'import', 'exec', 'eval', '__import__', 'open', 'file', 'input', 'raw_input',
+        'compile', 'reload', 'vars', 'locals', 'globals', 'dir', 'help', 'quit', 'exit',
+        'os', 'sys', 'subprocess', 'shutil', 'urllib', 'requests', 'socket',
+    }
+    
+    # Allowed function/attribute prefixes for pandas and numpy
+    ALLOWED_PREFIXES = ['pd.', 'np.', 'df.', 'df[']
+    
+    if isinstance(node, ast.Import) or isinstance(node, ast.ImportFrom):
+        raise ValueError("Import statements are not allowed for security reasons")
+    
+    if isinstance(node, ast.Name) and node.id in FORBIDDEN_NAMES:
+        raise ValueError(f"Forbidden operation: {node.id}")
+    
+    if isinstance(node, ast.Call):
+        # Check function calls
+        if isinstance(node.func, ast.Name):
+            if node.func.id in FORBIDDEN_NAMES:
+                raise ValueError(f"Forbidden function call: {node.func.id}")
+        elif isinstance(node.func, ast.Attribute):
+            # Check for dangerous method calls
+            full_name = ""
+            temp = node.func
+            while isinstance(temp, ast.Attribute):
+                full_name = "." + temp.attr + full_name
+                temp = temp.value
+            if isinstance(temp, ast.Name):
+                full_name = temp.id + full_name
+                
+            # Block dangerous methods
+            if any(danger in full_name.lower() for danger in ['system', 'popen', 'shell', 'exec']):
+                raise ValueError(f"Forbidden method call: {full_name}")
+    
+    if type(node) not in ALLOWED_NODES:
+        raise ValueError(f"Forbidden AST node type: {type(node).__name__}")
+    
+    # Recursively check all child nodes
+    for child in ast.iter_child_nodes(node):
+        check_ast(child)
+
+
 def build_prompt(df, target_name, description, iterative=1):
-    """Build prompt with live DataFrame context."""
+    """Build prompt with live DataFrame context, excluding target column to prevent data leakage."""
     how_many = (
         "up to 10 useful columns. Generate as many features as useful for downstream classifier, but as few as necessary to reach good performance."
         if iterative == 1
         else "exactly one useful column"
     )
     
-    # Generate column info with samples
+    # Create dataframe WITHOUT target column to prevent data leakage
+    df_features_only = df.drop(columns=[target_name] if target_name in df.columns else [])
+    
+    # Generate column info with samples (only for feature columns, NOT target)
     samples = ""
-    df_sample = df.head(10)
+    df_sample = df_features_only.head(10)
     for col in df_sample.columns:
-        nan_freq = f"{df[col].isna().mean() * 100:.1f}"
+        nan_freq = f"{df_features_only[col].isna().mean() * 100:.1f}"
         sample_values = df_sample[col].tolist()
         
-        if str(df[col].dtype) == "float64":
+        if str(df_features_only[col].dtype) == "float64":
             sample_values = [round(sample, 2) for sample in sample_values]
         
-        samples += f"{col} ({df[col].dtype}): NaN-freq [{nan_freq}%], Samples {sample_values}\n"
+        samples += f"{col} ({df_features_only[col].dtype}): NaN-freq [{nan_freq}%], Samples {sample_values}\n"
     
     return f"""The dataframe `df` is loaded and in memory. Columns are also named attributes.
 Description of the dataset in `df` (column dtypes might be inaccurate):
 "{description}"
 
-Columns in `df` (true feature dtypes listed here, categoricals encoded as int):
+AVAILABLE FEATURE COLUMNS in `df` (target column "{target_name}" is NOT accessible to prevent data leakage):
 {samples}
 
+IMPORTANT: The target column "{target_name}" is not available in the dataframe to prevent data leakage. You can only use the feature columns listed above.
+
 This code was written by an expert datascientist working to improve predictions. It is a snippet of code that adds new columns to the dataset.
-Number of samples (rows) in training dataset: {len(df)}
+Number of samples (rows) in training dataset: {len(df_features_only)}
 
 This code generates additional columns that are useful for a downstream classification algorithm (such as XGBoost) predicting "{target_name}".
 Additional columns add new semantic information, that is they use real world knowledge on the dataset. They can e.g. be feature combinations, transformations, aggregations where the new column is a function of the existing columns.
@@ -73,13 +143,29 @@ Codeblock:
 """
 
 
-def execute_code_safely(code, df):
-    """Execute LLM code safely."""
+def execute_code_safely(code, df, target_column=None):
+    """Execute LLM code safely without access to target column."""
     if not code.strip():
         return df
     
+    # Create a copy of the dataframe WITHOUT the target column to prevent data leakage
+    df_safe = df.copy()
+    if target_column and target_column in df_safe.columns:
+        df_safe = df_safe.drop(columns=[target_column])
+    
+    # Check if code tries to access the target column
+    if target_column and target_column in code:
+        raise ValueError(f"Data leakage detected: code attempts to use target column '{target_column}'")
+    
+    # AST security validation
+    try:
+        parsed = ast.parse(code, mode="exec")
+        check_ast(parsed)
+    except (SyntaxError, ValueError) as e:
+        raise ValueError(f"Code security validation failed: {e}")
+    
     local_vars = {
-        'df': df.copy(),
+        'df': df_safe,
         'pd': pd,
         'np': np
     }
@@ -90,8 +176,34 @@ def execute_code_safely(code, df):
         'min': min, 'sum': sum, 'round': round,
     }
     
-    exec(code, {"__builtins__": safe_builtins, "pd": pd, "np": np}, local_vars)
-    return local_vars['df']
+    try:
+        exec(compile(parsed, "", "exec"), {"__builtins__": safe_builtins, "pd": pd, "np": np}, local_vars)
+        result_df = local_vars['df']
+        
+        # Check for problematic values that could crash XGBoost
+        for col in result_df.columns:
+            if pd.api.types.is_numeric_dtype(result_df[col]):
+                # Only check numeric columns for inf/large values
+                if np.isinf(result_df[col]).any():
+                    raise ValueError(f"Column '{col}' contains infinite values")
+                if result_df[col].isna().all():
+                    raise ValueError(f"Column '{col}' contains all NaN values")
+                # Check for extremely large values that could cause numerical issues
+                if result_df[col].abs().max() > 1e10:
+                    raise ValueError(f"Column '{col}' contains extremely large values")
+            elif pd.api.types.is_categorical_dtype(result_df[col]) or pd.api.types.is_object_dtype(result_df[col]):
+                # For categorical/object columns, convert to category codes for XGBoost compatibility
+                if result_df[col].isna().all():
+                    raise ValueError(f"Column '{col}' contains all NaN values")
+                # Convert categorical/object columns to numeric codes to avoid XGBoost issues
+                if pd.api.types.is_categorical_dtype(result_df[col]) or pd.api.types.is_object_dtype(result_df[col]):
+                    result_df[col] = pd.Categorical(result_df[col]).codes.astype('int64')
+        
+        return result_df
+        
+    except Exception as e:
+        # Re-raise with more context
+        raise ValueError(f"Code execution error: {str(e)}")
 
 
 class CAAFE:
@@ -99,30 +211,45 @@ class CAAFE:
     
     def __init__(
         self,
+        provider: str = "openai",  # "openai" or "ollama"
         model: str = "gpt-4o-mini",
         api_key: Optional[str] = None,
+        ollama_base_url: str = "http://localhost:11434",
+        ollama_models_path: Optional[str] = None,
         max_iterations: int = 5,
         n_splits: int = 3,
         n_repeats: int = 2,
-        method: str = "xgb"
+        method: str = "xgb",
+        scorer=None  # Optional scorer object with .score(X, y) method
     ):
         """
         Initialize CAAFE.
         
         Args:
-            model: OpenAI model to use
-            api_key: OpenAI API key (uses env var if None)
+            provider: LLM provider ("openai" or "ollama")
+            model: LLM model to use
+            api_key: OpenAI API key (if using OpenAI)
+            ollama_base_url: Ollama server URL
+            ollama_models_path: Path to Ollama models directory
             max_iterations: Number of feature generation attempts
             n_splits: Cross-validation splits
             n_repeats: Cross-validation repeats
-            method: Evaluation method (xgb, logistic)
+            method: Evaluation method (xgb, logistic) - used only for fallback
+            scorer: Optional scorer object with .score(X, y) method
         """
+        self.provider = provider
         self.model = model
         self.api_key = api_key or os.getenv("OPENAI_API_KEY")
+        self.ollama_base_url = ollama_base_url
+        self.ollama_models_path = ollama_models_path
         self.max_iterations = max_iterations
         self.n_splits = n_splits
         self.n_repeats = n_repeats
         self.method = method
+        
+        # Use optimized Critic by default, fallback to legacy evaluation
+        self.scorer = scorer or Critic(folds=n_splits, repeats=n_repeats, n_jobs=-1)
+        
         self.generated_features = []
         self.full_code = ""
         self.messages = []
@@ -148,74 +275,152 @@ class CAAFE:
         target_name = y.name
         
         def generate_code(messages):
-            """Call OpenAI API."""
-            client = openai.OpenAI(api_key=self.api_key)
-            completion = client.chat.completions.create(
-                model=self.model,
-                messages=messages,
-                stop=["```end"],
-                temperature=0.5,
-                max_tokens=500
-            )
-            
-            code = completion.choices[0].message.content
-            return code.replace("```python", "").replace("```", "").replace("```end", "")
-        
-        def execute_and_evaluate(full_code, new_code):
-            """Execute code and evaluate with cross-validation."""
-            old_rocs, old_accs, new_rocs, new_accs = [], [], [], []
-            
-            ss = RepeatedKFold(n_splits=self.n_splits, n_repeats=self.n_repeats, random_state=0)
-            
-            for train_idx, valid_idx in ss.split(df):
-                df_train, df_valid = df.iloc[train_idx].copy(), df.iloc[valid_idx].copy()
+            """Call LLM API (OpenAI or Ollama)."""
+            if self.provider == "ollama":
+                # Set OLLAMA_MODELS environment variable if provided
+                if self.ollama_models_path:
+                    os.environ['OLLAMA_MODELS'] = self.ollama_models_path
                 
-                # Extract target
-                target_train = df_train[target_name]
-                target_valid = df_valid[target_name]
-                df_train_features = df_train.drop(columns=[target_name])
-                df_valid_features = df_valid.drop(columns=[target_name])
+                client = ollama.Client(host=self.ollama_base_url)
+                
+                # Define structured output schema for consistent code generation
+                schema = {
+                    "type": "object",
+                    "properties": {
+                        "feature_name": {
+                            "type": "string",
+                            "description": "Short descriptive name for the feature"
+                        },
+                        "explanation": {
+                            "type": "string", 
+                            "description": "Why this feature adds useful real world knowledge"
+                        },
+                        "code": {
+                            "type": "string",
+                            "description": "Single line of pandas code to generate the feature"
+                        }
+                    },
+                    "required": ["feature_name", "explanation", "code"]
+                }
+                
+                # Add structured output instruction to the last message
+                structured_messages = messages.copy()
+                last_message = structured_messages[-1]['content']
+                structured_messages[-1]['content'] = f"""{last_message}
+
+Return your response as JSON with this exact format:
+{{
+    "feature_name": "descriptive_name", 
+    "explanation": "Why this helps classify the target",
+    "code": "df['new_feature'] = # single line pandas expression"
+}}
+
+Generate exactly ONE feature. Use only pandas operations on existing columns."""
+                
+                response = client.chat(
+                    model=self.model,
+                    messages=structured_messages,
+                    format="json",  # Enable structured output
+                    options={
+                        'temperature': 0.1,  # Lower for more consistent outputs
+                        'num_predict': 300
+                    }
+                )
                 
                 try:
-                    # Apply old code
-                    df_train_old = execute_code_safely(full_code, df_train_features)
-                    df_valid_old = execute_code_safely(full_code, df_valid_features)
+                    import json
+                    result = json.loads(response['message']['content'])
+                    # Format as expected by the rest of the pipeline
+                    code = f"# ({result['feature_name']}: {result['explanation']})\n{result['code']}"
+                    return code
+                except (json.JSONDecodeError, KeyError) as e:
+                    # Fallback to raw content if JSON parsing fails
+                    return response['message']['content']
                     
-                    # Apply old + new code
-                    combined_code = full_code + "\n" + new_code if full_code.strip() else new_code
-                    df_train_new = execute_code_safely(combined_code, df_train_features)
-                    df_valid_new = execute_code_safely(combined_code, df_valid_features)
+            else:  # OpenAI
+                client = openai.OpenAI(api_key=self.api_key)
+                completion = client.chat.completions.create(
+                    model=self.model,
+                    messages=messages,
+                    stop=["```end"],
+                    temperature=0.5,
+                    max_tokens=500
+                )
+                code = completion.choices[0].message.content
+                return code.replace("```python", "").replace("```", "").replace("```end", "")
+        
+        def execute_and_evaluate(full_code, new_code):
+            """Execute code and evaluate with optimized Critic."""
+            try:
+                # Apply code to feature data (excluding target)
+                df_features = df.drop(columns=[target_name])
+                
+                # Apply old code
+                if full_code.strip():
+                    df_old = execute_code_safely(full_code, df_features, target_name)
+                else:
+                    df_old = df_features.copy()
+                
+                # Apply old + new code
+                combined_code = full_code + "\n" + new_code if full_code.strip() else new_code
+                df_new = execute_code_safely(combined_code, df_features, target_name)
+                
+                # Use optimized Critic for evaluation (handles its own CV internally)
+                try:
+                    old_roc = self.scorer.score(df_old, y)
+                    new_roc = self.scorer.score(df_new, y)
                     
-                    # Add target back
-                    df_train_old[target_name] = target_train
-                    df_valid_old[target_name] = target_valid
-                    df_train_new[target_name] = target_train
-                    df_valid_new[target_name] = target_valid
+                    # Return consistent format with single scores (Critic handles CV internally)
+                    # Duplicate values to maintain API compatibility
+                    old_rocs = [old_roc] * self.n_splits * self.n_repeats
+                    new_rocs = [new_roc] * self.n_splits * self.n_repeats
+                    old_accs = [old_roc] * self.n_splits * self.n_repeats  # Use ROC as proxy
+                    new_accs = [new_roc] * self.n_splits * self.n_repeats  # Use ROC as proxy
+                    
+                    return None, new_rocs, new_accs, old_rocs, old_accs
                     
                 except Exception as e:
-                    return e, None, None, None, None
-                
-                # Evaluate
-                result_old = evaluate_dataset(
-                    df_train=df_train_old,
-                    df_test=df_valid_old,
-                    target_name=target_name,
-                    method=self.method
-                )
-                
-                result_new = evaluate_dataset(
-                    df_train=df_train_new,
-                    df_test=df_valid_new,
-                    target_name=target_name,
-                    method=self.method
-                )
-                
-                old_rocs.append(result_old["roc"])
-                old_accs.append(result_old["acc"])
-                new_rocs.append(result_new["roc"])
-                new_accs.append(result_new["acc"])
-            
-            return None, new_rocs, new_accs, old_rocs, old_accs
+                    # Fallback to legacy evaluation if Critic fails
+                    print(f"⚠️  Critic failed, falling back to legacy evaluation: {e}")
+                    
+                    # Legacy CV loop as fallback
+                    old_rocs, old_accs, new_rocs, new_accs = [], [], [], []
+                    ss = RepeatedKFold(n_splits=self.n_splits, n_repeats=self.n_repeats, random_state=0)
+                    
+                    for train_idx, valid_idx in ss.split(df):
+                        df_train, df_valid = df.iloc[train_idx].copy(), df.iloc[valid_idx].copy()
+                        
+                        # Extract target
+                        target_train = df_train[target_name]
+                        target_valid = df_valid[target_name]
+                        df_train_features = df_train.drop(columns=[target_name])
+                        df_valid_features = df_valid.drop(columns=[target_name])
+                        
+                        # Apply transformations
+                        df_train_old = execute_code_safely(full_code, df_train_features, target_name)
+                        df_valid_old = execute_code_safely(full_code, df_valid_features, target_name)
+                        df_train_new = execute_code_safely(combined_code, df_train_features, target_name)
+                        df_valid_new = execute_code_safely(combined_code, df_valid_features, target_name)
+                        
+                        # Add target back for legacy evaluation
+                        df_train_old[target_name] = target_train
+                        df_valid_old[target_name] = target_valid
+                        df_train_new[target_name] = target_train
+                        df_valid_new[target_name] = target_valid
+                        
+                        # Legacy evaluation
+                        result_old = evaluate_dataset(df_train_old, df_valid_old, target_name, self.method)
+                        result_new = evaluate_dataset(df_train_new, df_valid_new, target_name, self.method)
+                        
+                        old_rocs.append(result_old["roc"])
+                        old_accs.append(result_old["acc"])
+                        new_rocs.append(result_new["roc"])
+                        new_accs.append(result_new["acc"])
+                    
+                    return None, new_rocs, new_accs, old_rocs, old_accs
+                    
+            except Exception as e:
+                return e, None, None, None, None
         
         # Initialize conversation
         prompt = build_prompt(df, target_name, description, self.max_iterations)
@@ -259,36 +464,57 @@ class CAAFE:
                 ]
                 continue
             
-            # Calculate improvements
+            # Calculate improvements - handle Critic vs legacy evaluation differently
             roc_improvement = np.nanmean(new_rocs) - np.nanmean(old_rocs)
-            acc_improvement = np.nanmean(new_accs) - np.nanmean(old_accs)
             
-            # Display results
-            print(f"Performance before adding features ROC {np.nanmean(old_rocs):.3f}, ACC {np.nanmean(old_accs):.3f}.")
-            print(f"Performance after adding features ROC {np.nanmean(new_rocs):.3f}, ACC {np.nanmean(new_accs):.3f}.")
-            print(f"Improvement ROC {roc_improvement:.3f}, ACC {acc_improvement:.3f}.", end=" ")
+            # Check if we're using Critic (ROC-only) or legacy evaluation (ROC + ACC)
+            using_critic = hasattr(self.scorer, 'score') and hasattr(self.scorer, 'folds')
+            
+            if using_critic:
+                # Critic mode: use ROC only (acc arrays contain duplicated ROC values)
+                acc_improvement = 0.0
+                decision_metric = roc_improvement
+                
+                # Display results (show that ACC is same as ROC for Critic)
+                print(f"Performance before adding features ROC {np.nanmean(old_rocs):.3f}.")
+                print(f"Performance after adding features ROC {np.nanmean(new_rocs):.3f}.")
+                print(f"Improvement ROC {roc_improvement:.3f}.", end=" ")
+            else:
+                # Legacy mode: use both ROC and ACC
+                acc_improvement = np.nanmean(new_accs) - np.nanmean(old_accs)
+                decision_metric = roc_improvement + acc_improvement
+                
+                # Display results
+                print(f"Performance before adding features ROC {np.nanmean(old_rocs):.3f}, ACC {np.nanmean(old_accs):.3f}.")
+                print(f"Performance after adding features ROC {np.nanmean(new_rocs):.3f}, ACC {np.nanmean(new_accs):.3f}.")
+                print(f"Improvement ROC {roc_improvement:.3f}, ACC {acc_improvement:.3f}.", end=" ")
             
             # Decide whether to keep
-            add_feature = (roc_improvement + acc_improvement) > 0
+            add_feature = decision_metric > 0
             add_feature_sentence = (
                 "The code was executed and changes to ´df´ were kept." if add_feature
-                else f"The last code changes to ´df´ were discarded. (Improvement: {roc_improvement + acc_improvement:.3f})"
+                else f"The last code changes to ´df´ were discarded. (Improvement: {decision_metric:.3f})"
             )
             print(add_feature_sentence)
             
             # Update conversation
             if len(code) > 10:
+                if using_critic:
+                    perf_message = f"Performance after adding feature ROC {np.nanmean(new_rocs):.3f}. {add_feature_sentence}\nNext codeblock:"
+                else:
+                    perf_message = f"Performance after adding feature ROC {np.nanmean(new_rocs):.3f}, ACC {np.nanmean(new_accs):.3f}. {add_feature_sentence}\nNext codeblock:"
+                
                 self.messages += [
                     {"role": "assistant", "content": code},
-                    {"role": "user", "content": f"Performance after adding feature ROC {np.nanmean(new_rocs):.3f}, ACC {np.nanmean(new_accs):.3f}. {add_feature_sentence}\nNext codeblock:"}
+                    {"role": "user", "content": perf_message}
                 ]
             
             # Keep feature if it helps
             if add_feature:
                 self.full_code += "\n" + code
-                # Track new features
+                # Track new features (with target column protection)
                 try:
-                    df_temp = execute_code_safely(self.full_code, X.copy())
+                    df_temp = execute_code_safely(self.full_code, X.copy(), target_name)
                     new_features = [col for col in df_temp.columns if col not in X.columns]
                     for feat in new_features:
                         if feat not in self.generated_features:
@@ -302,7 +528,7 @@ class CAAFE:
         
         # Apply final code and return enhanced DataFrame
         if self.full_code.strip():
-            enhanced_df = execute_code_safely(self.full_code, X.copy())
+            enhanced_df = execute_code_safely(self.full_code, X.copy(), target_name)
             return enhanced_df
         else:
             return X
