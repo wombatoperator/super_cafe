@@ -32,7 +32,10 @@ def check_ast(node):
         ast.Add, ast.Sub, ast.Mult, ast.Div, ast.Mod, ast.Pow, ast.FloorDiv,
         ast.And, ast.Or, ast.Not, ast.Eq, ast.NotEq, ast.Lt, ast.LtE, ast.Gt, ast.GtE,
         ast.Is, ast.IsNot, ast.In, ast.NotIn,
-        ast.Constant, ast.Num, ast.Str, ast.NameConstant,  # Literals
+        ast.BitAnd, ast.BitOr, ast.BitXor,  # Bitwise operators for pandas boolean operations
+        ast.Constant,  # Literals (covers old Num, Str, NameConstant in Python 3.8+)
+        # Backward compatibility for Python < 3.8
+        getattr(ast, 'Num', type(None)), getattr(ast, 'Str', type(None)), getattr(ast, 'NameConstant', type(None)),
         ast.List, ast.Tuple, ast.Dict, ast.Set,  # Containers
         ast.ListComp, ast.DictComp, ast.SetComp, ast.GeneratorExp,  # Comprehensions
         ast.Lambda, ast.arguments, ast.arg,  # Lambda functions and arguments for pandas operations
