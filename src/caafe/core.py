@@ -9,7 +9,7 @@ import openai
 import ollama
 import os
 import ast
-from sklearn.model_selection import RepeatedKFold
+from sklearn.model_selection import RepeatedKFold, train_test_split
 from .evaluation import evaluate_dataset
 from .critic import Critic
 from typing import Optional
@@ -142,6 +142,15 @@ df.drop(columns=['XX'], inplace=True)
 
 Each codeblock generates {how_many} and can drop unused columns (Feature selection).
 Each codeblock ends with ```end and starts with "```python"
+
+HARD RULES - FOLLOW EXACTLY:
+• The code must return a Series the same length as df
+• ALLOWED: arithmetic on numeric cols, pd.Series.transform('...'), np.log1p, freq_encode()
+• DISALLOWED: groupby().agg/pivot producing fewer rows, referencing columns not listed above
+
+AVAILABLE COLUMNS (only these can be used):
+{', '.join(df_features_only.columns)}
+
 Codeblock:
 """
 
@@ -167,6 +176,12 @@ def execute_code_safely(code, df, target_column=None):
     except (SyntaxError, ValueError) as e:
         raise ValueError(f"Code security validation failed: {e}")
     
+    # Define freq_encode helper for safe frequency encoding
+    def freq_encode(col):
+        """Helper function for safe frequency encoding."""
+        vc = df_safe[col].value_counts()
+        return df_safe[col].map(vc)
+    
     local_vars = {
         'df': df_safe,
         'pd': pd,
@@ -177,6 +192,7 @@ def execute_code_safely(code, df, target_column=None):
         'int': int, 'float': float, 'str': str, 'bool': bool,
         'len': len, 'range': range, 'abs': abs, 'max': max, 
         'min': min, 'sum': sum, 'round': round,
+        'freq_encode': freq_encode,  # Add frequency encoding helper
     }
     
     try:
@@ -277,6 +293,18 @@ class CAAFE:
         df[y.name] = y
         target_name = y.name
         
+        # Hold-out confirmation split to prevent overfitting to dev CV
+        df_dev, df_hold = train_test_split(
+            df, test_size=0.2, stratify=y, random_state=42
+        )
+        y_dev = df_dev[target_name]
+        y_hold = df_hold[target_name]
+        
+        print(f"Split: {len(df_dev)} dev samples, {len(df_hold)} hold-out samples")
+        
+        # Use dev set for iteration (df becomes df_dev)
+        df = df_dev
+        
         def generate_code(messages):
             """Call LLM API (OpenAI or Ollama)."""
             if self.provider == "ollama":
@@ -370,15 +398,14 @@ Generate exactly ONE feature. Use only pandas operations on existing columns."""
                 
                 # Use optimized Critic for evaluation (handles its own CV internally)
                 try:
-                    old_roc = self.scorer.score(df_old, y)
-                    new_roc = self.scorer.score(df_new, y)
+                    old_roc = self.scorer.score(df_old, y_dev)
+                    new_roc = self.scorer.score(df_new, y_dev)
                     
                     # Return consistent format with single scores (Critic handles CV internally)
-                    # Duplicate values to maintain API compatibility
-                    old_rocs = [old_roc] * self.n_splits * self.n_repeats
-                    new_rocs = [new_roc] * self.n_splits * self.n_repeats
-                    old_accs = [old_roc] * self.n_splits * self.n_repeats  # Use ROC as proxy
-                    new_accs = [new_roc] * self.n_splits * self.n_repeats  # Use ROC as proxy
+                    old_rocs = [old_roc]
+                    new_rocs = [new_roc]
+                    old_accs = [old_roc]  # Minimal for API compatibility
+                    new_accs = [new_roc]  # Minimal for API compatibility
                     
                     return None, new_rocs, new_accs, old_rocs, old_accs
                     
@@ -425,7 +452,7 @@ Generate exactly ONE feature. Use only pandas operations on existing columns."""
             except Exception as e:
                 return e, None, None, None, None
         
-        # Initialize conversation
+        # Initialize conversation (using dev set)
         prompt = build_prompt(df, target_name, description, self.max_iterations)
         
         self.messages = [
@@ -471,17 +498,21 @@ Generate exactly ONE feature. Use only pandas operations on existing columns."""
             roc_improvement = np.nanmean(new_rocs) - np.nanmean(old_rocs)
             
             # Check if we're using Critic (ROC-only) or legacy evaluation (ROC + ACC)
-            using_critic = hasattr(self.scorer, 'score') and hasattr(self.scorer, 'folds')
+            using_critic = isinstance(self.scorer, Critic)
             
             if using_critic:
-                # Critic mode: use ROC only (acc arrays contain duplicated ROC values)
+                # Critic mode: use ROC only with stricter acceptance threshold
+                epsilon = 0.002  # Require ≥0.2-pt ROC lift to avoid noisy +0.001 blips
                 acc_improvement = 0.0
                 decision_metric = roc_improvement
                 
                 # Display results (show that ACC is same as ROC for Critic)
                 print(f"Performance before adding features ROC {np.nanmean(old_rocs):.3f}.")
                 print(f"Performance after adding features ROC {np.nanmean(new_rocs):.3f}.")
-                print(f"Improvement ROC {roc_improvement:.3f}.", end=" ")
+                print(f"Improvement ROC {roc_improvement:.3f} (req. ≥{epsilon:.3f}).", end=" ")
+                
+                # Tightened acceptance gate
+                add_feature = roc_improvement > epsilon
             else:
                 # Legacy mode: use both ROC and ACC
                 acc_improvement = np.nanmean(new_accs) - np.nanmean(old_accs)
@@ -491,9 +522,9 @@ Generate exactly ONE feature. Use only pandas operations on existing columns."""
                 print(f"Performance before adding features ROC {np.nanmean(old_rocs):.3f}, ACC {np.nanmean(old_accs):.3f}.")
                 print(f"Performance after adding features ROC {np.nanmean(new_rocs):.3f}, ACC {np.nanmean(new_accs):.3f}.")
                 print(f"Improvement ROC {roc_improvement:.3f}, ACC {acc_improvement:.3f}.", end=" ")
-            
-            # Decide whether to keep
-            add_feature = decision_metric > 0
+                
+                # Legacy acceptance gate
+                add_feature = decision_metric > 0
             add_feature_sentence = (
                 "The code was executed and changes to ´df´ were kept." if add_feature
                 else f"The last code changes to ´df´ were discarded. (Improvement: {decision_metric:.3f})"
@@ -529,10 +560,39 @@ Generate exactly ONE feature. Use only pandas operations on existing columns."""
         
         print(f"Completed! Generated {len(self.generated_features)} useful features")
         
-        # Apply final code and return enhanced DataFrame
+        # Hold-out confirmation pass to prevent overfitting to dev CV
         if self.full_code.strip():
-            enhanced_df = execute_code_safely(self.full_code, X.copy(), target_name)
-            return enhanced_df
+            print(f"\n🔍 Hold-out confirmation pass...")
+            
+            # Apply features to both dev and hold-out sets
+            df_dev_features = df_dev.drop(columns=[target_name])
+            df_hold_features = df_hold.drop(columns=[target_name])
+            
+            # Original features (no generated features)
+            df_dev_old = df_dev_features.copy()
+            df_hold_old = df_hold_features.copy()
+            
+            # Enhanced features (with generated features)
+            df_dev_new = execute_code_safely(self.full_code, df_dev_features, target_name)
+            df_hold_new = execute_code_safely(self.full_code, df_hold_features, target_name)
+            
+            # Evaluate on hold-out set
+            roc_hold_old = self.scorer.score(df_hold_old, y_hold)
+            roc_hold_new = self.scorer.score(df_hold_new, y_hold)
+            hold_improvement = roc_hold_new - roc_hold_old
+            
+            print(f"Hold-out validation: {roc_hold_old:.3f} → {roc_hold_new:.3f} (Δ{hold_improvement:+.3f})")
+            
+            # Keep features only if they improve on hold-out
+            keep_features = hold_improvement > 0
+            
+            if keep_features:
+                print(f"✅ Features confirmed on hold-out set")
+                enhanced_df = execute_code_safely(self.full_code, X.copy(), target_name)
+                return enhanced_df
+            else:
+                print(f"❌ Features rejected - overfitted to dev set")
+                return X
         else:
             return X
     
