@@ -36,6 +36,25 @@ def evaluate_dataset(
     X_test = df_test.drop(columns=[target_name])
     y_test = df_test[target_name]
     
+    # Handle categorical and object columns first
+    for col in X_train.columns:
+        if (X_train[col].dtype.name == 'category' or X_test[col].dtype.name == 'category' or 
+            X_train[col].dtype == 'object' or X_test[col].dtype == 'object'):
+            
+            # For object columns, convert to category first
+            if X_train[col].dtype == 'object':
+                X_train[col] = X_train[col].astype('category')
+            if X_test[col].dtype == 'object':
+                X_test[col] = X_test[col].astype('category')
+            
+            # Ensure both have same categories
+            all_cats = pd.api.types.union_categoricals([X_train[col], X_test[col]]).categories
+            X_train[col] = X_train[col].astype('category').cat.set_categories(all_cats)
+            X_test[col] = X_test[col].astype('category').cat.set_categories(all_cats)
+            # Convert to numeric codes
+            X_train[col] = X_train[col].cat.codes
+            X_test[col] = X_test[col].cat.codes
+    
     # Handle missing values
     X_train = X_train.fillna(0)
     X_test = X_test.fillna(0)
@@ -162,7 +181,20 @@ def execute_code_safely(code: str, df: pd.DataFrame) -> pd.DataFrame:
         'np': np
     }
     
-    # Execute code
-    exec(code, {"__builtins__": {}, "pd": pd, "np": np}, local_vars)
+    # Execute code with safe built-ins
+    safe_builtins = {
+        'int': int,
+        'float': float,
+        'str': str,
+        'bool': bool,
+        'len': len,
+        'range': range,
+        'abs': abs,
+        'max': max,
+        'min': min,
+        'sum': sum,
+        'round': round,
+    }
+    exec(code, {"__builtins__": safe_builtins, "pd": pd, "np": np}, local_vars)
     
     return local_vars['df']

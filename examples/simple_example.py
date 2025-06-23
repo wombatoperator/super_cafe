@@ -71,11 +71,11 @@ def main():
     
     try:
         # Generate features - this is the main API!
-        X_enhanced = caafe.generate_features(
+        caafe_model = caafe.CAAFE(max_iterations=3, model="gpt-4o-mini")
+        X_enhanced = caafe_model.generate_features(
             X=X,
             y=y, 
-            description=description,
-            max_iterations=3  # Keep it short for demo
+            description=description.strip()
         )
         
         print(f"\n✅ Success!")
