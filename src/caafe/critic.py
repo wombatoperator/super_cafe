@@ -32,8 +32,13 @@ from sklearn.model_selection import train_test_split, RepeatedStratifiedKFold
 
 try:
     from xgboost import XGBClassifier
+    import xgboost as xgb
+    # Check version compatibility
+    xgb_version = tuple(map(int, xgb.__version__.split('.')[:2]))
+    if xgb_version < (2, 0):
+        raise ImportError(f"XGBoost version {xgb.__version__} detected. Please install XGBoost>=2.0 for optimal performance: `pip install xgboost>=2.0`")
 except ModuleNotFoundError as exc:
-    raise ImportError("XGBoost not installed – `pip install xgboost>=2.0`. ") from exc
+    raise ImportError("XGBoost not installed. Please install with: `pip install xgboost>=2.0`") from exc
 
 # ---------------------------------------------------------------------------
 # Helpers --------------------------------------------------------------------
@@ -64,7 +69,7 @@ def _clean_target(y: pd.Series) -> pd.Series:
 # Critic class ----------------------------------------------------------------
 # ---------------------------------------------------------------------------
 
-@dataclass(slots=True)
+@dataclass
 class Critic:
     """ROC-AUC scorer based on a fixed, tuned XGBoost model."""
     folds: int = 3
@@ -79,6 +84,9 @@ class Critic:
     def __post_init__(self) -> None:
         if self.holdout is not None:
             assert 0 < self.holdout < 1, "holdout must be between 0 and 1"
+        
+        # Initialize feature importance storage
+        self.feature_importances_ = []
         
         # [OPTIMIZED] Using well-tuned hyperparameters for speed and accuracy
         self._model = XGBClassifier(
@@ -102,17 +110,90 @@ class Critic:
         y_bin = _clean_target(y)
         X_sync = _clean_df(X.loc[y_bin.index])
 
-        # Auto-switch to holdout for large datasets (≥10k rows)
-        if len(X_sync) >= 10000:
-            self.holdout = 0.2
-            return self._holdout_auc(X_sync, y_bin)
-        elif self.holdout:
-            return self._holdout_auc(X_sync, y_bin)
+        # Auto-switch to holdout for large datasets (≥10k rows) - use local flag, don't mutate instance
+        use_holdout = len(X_sync) >= 10000 or self.holdout is not None
+        if use_holdout:
+            # Use configured holdout or default 0.2 for large datasets
+            holdout_size = self.holdout if self.holdout is not None else 0.2
+            return self._holdout_auc(X_sync, y_bin, holdout_size)
         return self._cv_auc(X_sync, y_bin)
 
     def score_delta(self, X: pd.DataFrame, y: pd.Series, baseline_auc: float) -> float:
         """Calculates the performance improvement over a baseline."""
         return self.score(X, y) - baseline_auc
+    
+    def get_feature_importance(self, X: pd.DataFrame, y: pd.Series, method: str = "gain") -> pd.DataFrame:
+        """Get feature importance analysis after scoring.
+        
+        Args:
+            X: Feature dataframe
+            y: Target series
+            method: Importance type ('gain', 'weight', 'cover')
+            
+        Returns:
+            DataFrame with features and their importance scores
+        """
+        y_bin = _clean_target(y)
+        X_sync = _clean_df(X.loc[y_bin.index])
+        
+        # Train model on full dataset for feature importance
+        self._model.fit(X_sync.values, y_bin.values)
+        
+        # Get importance scores
+        if method == "gain":
+            importance_scores = self._model.feature_importances_
+        else:
+            importance_dict = self._model.get_booster().get_score(importance_type=method)
+            # Map back to feature indices
+            importance_scores = [importance_dict.get(f"f{i}", 0) for i in range(len(X_sync.columns))]
+        
+        # Store for later access
+        self.feature_importances_ = importance_scores.copy() if hasattr(importance_scores, 'copy') else list(importance_scores)
+        
+        # Create DataFrame with feature names and importance
+        importance_df = pd.DataFrame({
+            'feature': X_sync.columns,
+            'importance': importance_scores
+        }).sort_values('importance', ascending=False)
+        
+        return importance_df
+    
+    def analyze_feature_impact(self, X_baseline: pd.DataFrame, X_enhanced: pd.DataFrame, y: pd.Series) -> dict:
+        """Analyze the impact of new features on model performance.
+        
+        Args:
+            X_baseline: Original features
+            X_enhanced: Features with new additions
+            y: Target variable
+            
+        Returns:
+            Dictionary with feature impact analysis
+        """
+        # Get baseline performance and importance
+        baseline_score = self.score(X_baseline, y)
+        baseline_importance = self.get_feature_importance(X_baseline, y)
+        
+        # Get enhanced performance and importance  
+        enhanced_score = self.score(X_enhanced, y)
+        enhanced_importance = self.get_feature_importance(X_enhanced, y)
+        
+        # Identify new features
+        new_features = [col for col in X_enhanced.columns if col not in X_baseline.columns]
+        
+        # Get importance of new features
+        new_feature_importance = enhanced_importance[
+            enhanced_importance['feature'].isin(new_features)
+        ].copy()
+        
+        return {
+            'baseline_score': baseline_score,
+            'enhanced_score': enhanced_score,
+            'score_improvement': enhanced_score - baseline_score,
+            'new_features': new_features,
+            'new_feature_importance': new_feature_importance.to_dict('records'),
+            'top_overall_features': enhanced_importance.head(10).to_dict('records'),
+            'baseline_top_features': baseline_importance.head(10).to_dict('records')
+        }
 
     def _cv_auc(self, X: pd.DataFrame, y: pd.Series) -> float:
         """[STABILITY] Uses RepeatedStratifiedKFold for more robust evaluation."""
@@ -129,15 +210,23 @@ class Critic:
             probas = self._model.predict_proba(X_test)[:, 1]
             oof_preds[test_idx] = probas
             self.fold_scores.append(roc_auc_score(y_test, probas))
+            
+            # Store feature importance from first fold for analysis
+            if i == 0:
+                self.feature_importances_ = self._model.feature_importances_.tolist()
 
         return roc_auc_score(y_np, oof_preds)
 
-    def _holdout_auc(self, X: pd.DataFrame, y: pd.Series) -> float:
+    def _holdout_auc(self, X: pd.DataFrame, y: pd.Series, holdout_size: float = 0.2) -> float:
         """Calculates ROC AUC on a single train-test split."""
         X_train, X_test, y_train, y_test = train_test_split(
-            X.values, y.values, test_size=self.holdout, random_state=self.seed, stratify=y.values
+            X.values, y.values, test_size=holdout_size, random_state=self.seed, stratify=y.values
         )
         self._model.fit(X_train, y_train)
         prob = self._model.predict_proba(X_test)[:, 1]
         self.fold_scores = [roc_auc_score(y_test, prob)] # Keep API consistent
+        
+        # Store feature importance for analysis
+        self.feature_importances_ = self._model.feature_importances_.tolist()
+        
         return self.fold_scores[0]

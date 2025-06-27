@@ -35,8 +35,9 @@ model.fit(X_enhanced, y)
 - **XGBoost Optimized**: Prompts designed specifically for gradient boosting
 - **Data Leakage Protection**: Prevents target column access during feature generation
 - **Optimized Evaluation**: Fast XGBoost Critic with pre-tuned hyperparameters
+- **Feature Importance Analysis**: Built-in analysis of generated feature impact
 - **Structured Outputs**: JSON-based responses for consistent local model performance
-- **Original CAAFE Spirit**: Maintains the elegance of the original implementation
+- **Production Ready**: Comprehensive bug fixes and safety measures
 
 ## 📦 Installation
 
@@ -62,6 +63,7 @@ ollama pull llama3:8b-instruct-q4_K_M
 import pandas as pd
 import numpy as np
 from caafe import CAAFE
+from caafe.critic import Critic
 
 # Create sample data
 np.random.seed(42)
@@ -76,27 +78,32 @@ X = pd.DataFrame({
 default_prob = 0.1 + 0.2 * (X['debt'] / X['income']).clip(0, 1)
 y = pd.Series(np.random.binomial(1, default_prob), name='default')
 
-# Example 1: OpenAI
-caafe_openai = CAAFE(provider="openai", model="gpt-4o-mini", max_iterations=3)
-X_enhanced_openai = caafe_openai.generate_features(
-    X=X, y=y, description="Loan default prediction with financial and demographic data"
-)
-
-# Example 2: Local Ollama
-caafe_local = CAAFE(
+# Create CAAFE instance with optimized Critic
+critic = Critic(folds=3, repeats=2)
+caafe = CAAFE(
     provider="ollama", 
     model="llama3:8b-instruct-q4_K_M",
-    max_iterations=3
-)
-X_enhanced_local = caafe_local.generate_features(
-    X=X, y=y, description="Loan default prediction with financial and demographic data"
+    max_iterations=3,
+    scorer=critic
 )
 
+# Generate features
+X_enhanced = caafe.generate_features(
+    X=X, y=y, 
+    description="Loan default prediction with financial and demographic data"
+)
+
+# Analyze feature importance
+if X_enhanced.shape[1] > X.shape[1]:
+    impact_analysis = critic.analyze_feature_impact(X, X_enhanced, y)
+    print(f"Performance improvement: {impact_analysis['score_improvement']:+.3f}")
+    print("New feature importance:")
+    for feat in impact_analysis['new_feature_importance']:
+        print(f"  {feat['feature']}: {feat['importance']:.3f}")
+
 print(f"Original: {X.shape[1]} features")
-print(f"OpenAI enhanced: {X_enhanced_openai.shape[1]} features")
-print(f"Ollama enhanced: {X_enhanced_local.shape[1]} features")
-print(f"OpenAI generated: {caafe_openai.get_generated_features()}")
-print(f"Ollama generated: {caafe_local.get_generated_features()}")
+print(f"Enhanced: {X_enhanced.shape[1]} features") 
+print(f"Generated: {caafe.get_generated_features()}")
 ```
 
 ## 🔧 API Reference
@@ -130,6 +137,24 @@ print(f"Ollama generated: {caafe_local.get_generated_features()}")
 **Returns:**
 - Enhanced DataFrame with original + generated features
 
+### `Critic` Class - Advanced Evaluation & Analysis
+
+```python
+from caafe.critic import Critic
+
+# Create optimized XGBoost evaluator
+critic = Critic(folds=3, repeats=2, n_jobs=-1)
+
+# Basic scoring
+roc_score = critic.score(X, y)
+
+# Feature importance analysis
+importance_df = critic.get_feature_importance(X, y, method="gain")
+
+# Compare baseline vs enhanced features
+impact_analysis = critic.analyze_feature_impact(X_baseline, X_enhanced, y)
+```
+
 ## 🏗️ How It Works
 
 1. **Data Leakage Protection**: Removes target column from LLM prompts
@@ -137,8 +162,9 @@ print(f"Ollama generated: {caafe_local.get_generated_features()}")
 3. **Structured Outputs**: Uses JSON schema for consistent local model responses
 4. **Optimized Evaluation**: Fast XGBoost Critic with pre-tuned hyperparameters
 5. **Cross-Validation**: RepeatedStratifiedKFold for robust performance assessment  
-6. **Iterative Improvement**: Keeps features that improve ROC-AUC + accuracy
+6. **Iterative Improvement**: Keeps features that improve ROC-AUC performance
 7. **Safety Checks**: Validates generated code and handles edge cases
+8. **Feature Analysis**: Built-in importance analysis for generated features
 
 ## 📊 Generated Feature Examples
 
@@ -198,6 +224,25 @@ CAAFE includes comprehensive safety measures:
 - **Input Validation**: Checks for infinite values, extreme outliers, and NaN issues
 - **Error Recovery**: Robust exception handling with automatic fallbacks
 - **JSON Schema Validation**: Structured outputs prevent malformed code generation
+
+## 🚀 Recent Updates (v2.0)
+
+### Major Bug Fixes & Optimizations
+- **Fixed holdout mutation bug**: Large datasets no longer affect subsequent evaluations
+- **Corrected feature acceptance logic**: Eliminated threshold doubling issues
+- **Enhanced accuracy calculation**: True accuracy computation (not ROC duplication)
+- **Improved dependency handling**: Better XGBoost version checking and error messages
+
+### New Features
+- **Feature importance analysis**: Built-in analysis of generated feature impact
+- **Streamlined evaluation**: Simplified `evaluation.py` to pure compatibility wrapper
+- **Enhanced real dataset testing**: Better integration with `real_datasets.py`
+- **Production hardening**: Comprehensive testing and validation improvements
+
+### Architecture Improvements
+- **Optimized Critic class**: Fast, reliable XGBoost-based evaluation
+- **Multi-LLM consistency**: Unified evaluation across OpenAI and Ollama
+- **Clean separation of concerns**: Core logic separated from legacy compatibility
 
 ## 📝 Requirements
 

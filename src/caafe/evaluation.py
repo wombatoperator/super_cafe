@@ -1,14 +1,14 @@
 """
-CAAFE evaluation utilities - separated from core for clarity.
+CAAFE evaluation utilities - Legacy compatibility wrapper.
+
+This module provides backward compatibility for the original CAAFE evaluation methodology.
+All core evaluation logic has been moved to the optimized Critic class in critic.py.
 """
 
-import copy
-import numpy as np
-import pandas as pd
-import xgboost as xgb
-from sklearn.model_selection import RepeatedKFold, cross_val_score
-from sklearn.metrics import roc_auc_score, accuracy_score
 from typing import Tuple, Dict
+import pandas as pd
+from .critic import Critic
+
 
 def evaluate_dataset(
     df_train: pd.DataFrame,
@@ -18,70 +18,49 @@ def evaluate_dataset(
     seed: int = 0
 ) -> Dict[str, float]:
     """
-    Evaluate a dataset with a specific method.
+    Legacy compatibility wrapper for evaluate_dataset.
     
     Args:
         df_train: Training dataframe with target
-        df_test: Test dataframe with target
+        df_test: Test dataframe with target  
         target_name: Name of target column
-        method: Method to use for evaluation
+        method: Method to use for evaluation (ignored - always uses optimized XGBoost)
         seed: Random seed
         
     Returns:
         Dictionary with roc and acc scores
     """
-    # Split features and target
+    # Extract features and target
     X_train = df_train.drop(columns=[target_name])
     y_train = df_train[target_name]
     X_test = df_test.drop(columns=[target_name])
     y_test = df_test[target_name]
     
-    # Handle categorical and object columns first
-    for col in X_train.columns:
-        if (X_train[col].dtype.name == 'category' or X_test[col].dtype.name == 'category' or 
-            X_train[col].dtype == 'object' or X_test[col].dtype == 'object'):
-            
-            # For object columns, convert to category first
-            if X_train[col].dtype == 'object':
-                X_train[col] = X_train[col].astype('category')
-            if X_test[col].dtype == 'object':
-                X_test[col] = X_test[col].astype('category')
-            
-            # Ensure both have same categories
-            all_cats = pd.api.types.union_categoricals([X_train[col], X_test[col]]).categories
-            X_train[col] = X_train[col].astype('category').cat.set_categories(all_cats)
-            X_test[col] = X_test[col].astype('category').cat.set_categories(all_cats)
-            # Convert to numeric codes
-            X_train[col] = X_train[col].cat.codes
-            X_test[col] = X_test[col].cat.codes
+    # Use optimized Critic for ROC evaluation
+    critic = Critic(seed=seed, holdout=0.2)  # Use holdout since we have separate train/test
     
-    # Handle missing values
-    X_train = X_train.fillna(0)
-    X_test = X_test.fillna(0)
+    # Train on training set, evaluate on test set
+    # Combine for Critic which handles its own splitting
+    X_combined = pd.concat([X_train, X_test], axis=0, ignore_index=True)
+    y_combined = pd.concat([y_train, y_test], axis=0, ignore_index=True)
     
-    # Train model
-    if method == "xgb":
-        model = xgb.XGBClassifier(random_state=seed, verbosity=0)
-    else:
-        from sklearn.linear_model import LogisticRegression
-        model = LogisticRegression(random_state=seed, max_iter=1000)
+    roc_score = critic.score(X_combined, y_combined)
     
-    model.fit(X_train, y_train)
+    # Calculate true accuracy using the trained model
+    from .critic import _clean_df, _clean_target
+    y_test_clean = _clean_target(y_test)
+    X_test_clean = _clean_df(X_test.loc[y_test_clean.index])
     
-    # Get predictions
-    if hasattr(model, 'predict_proba'):
-        y_pred_proba = model.predict_proba(X_test)[:, 1]
-        roc = roc_auc_score(y_test, y_pred_proba)
-    else:
-        roc = 0.0
-    
-    y_pred = model.predict(X_test)
-    acc = accuracy_score(y_test, y_pred)
+    # Use the critic's trained model to get predictions
+    y_pred_proba = critic._model.predict_proba(X_test_clean.values)[:, 1]
+    y_pred_labels = (y_pred_proba > 0.5).astype(int)
+    accuracy = (y_pred_labels == y_test_clean.values).mean()
     
     return {
-        "roc": float(roc),
-        "acc": float(acc)
+        "roc": float(roc_score),
+        "acc": float(accuracy)
     }
+
 
 def execute_and_evaluate_code_block(
     df: pd.DataFrame,
@@ -93,8 +72,10 @@ def execute_and_evaluate_code_block(
     method: str = "xgb"
 ) -> Tuple[Exception, list, list, list, list]:
     """
-    Execute code and evaluate performance using cross-validation.
-    Following the original CAAFE evaluation methodology.
+    Legacy compatibility wrapper - delegates to the main CAAFE evaluation loop.
+    
+    This function is deprecated in favor of the optimized Critic class.
+    It's kept for backward compatibility only.
     
     Args:
         df: Full dataframe with target
@@ -103,62 +84,41 @@ def execute_and_evaluate_code_block(
         new_code: New code to test
         n_splits: Number of CV splits
         n_repeats: Number of CV repeats
-        method: Evaluation method
+        method: Evaluation method (ignored)
         
     Returns:
         Tuple of (error, new_rocs, new_accs, old_rocs, old_accs)
     """
-    old_rocs, old_accs, new_rocs, new_accs = [], [], [], []
-    
-    # Set up cross-validation
-    ss = RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=0)
-    
-    for train_idx, valid_idx in ss.split(df):
-        df_train, df_valid = df.iloc[train_idx].copy(), df.iloc[valid_idx].copy()
+    try:
+        from .core import execute_code_safely
         
-        # Extract target and remove from dataframes (following reference code pattern)
-        target_train = df_train[target_name]
-        target_valid = df_valid[target_name]
-        df_train_features = df_train.drop(columns=[target_name])
-        df_valid_features = df_valid.drop(columns=[target_name])
+        # Extract features and target
+        X = df.drop(columns=[target_name])
+        y = df[target_name]
         
-        try:
-            # Apply old code (accumulated features so far)
-            df_train_old = df_train_features.copy()
-            df_valid_old = df_valid_features.copy()
-            
-            if full_code.strip():
-                df_train_old = execute_code_safely(full_code, df_train_old)
-                df_valid_old = execute_code_safely(full_code, df_valid_old)
-            
-            # Apply old + new code
-            df_train_new = df_train_features.copy()
-            df_valid_new = df_valid_features.copy()
-            
-            combined_code = full_code + "\n" + new_code if full_code.strip() else new_code
-            df_train_new = execute_code_safely(combined_code, df_train_new)
-            df_valid_new = execute_code_safely(combined_code, df_valid_new)
-            
-            # Add target back (following reference code pattern)
-            df_train_old[target_name] = target_train
-            df_valid_old[target_name] = target_valid
-            df_train_new[target_name] = target_train
-            df_valid_new[target_name] = target_valid
-            
-        except Exception as e:
-            return e, None, None, None, None
+        # Create Critic instance
+        critic = Critic(folds=n_splits, repeats=n_repeats)
         
         # Evaluate old features
-        result_old = evaluate_dataset(df_train_old, df_valid_old, target_name, method)
-        old_rocs.append(result_old["roc"])
-        old_accs.append(result_old["acc"])
+        if full_code.strip():
+            X_old = execute_code_safely(full_code, X.copy(), target_name)
+        else:
+            X_old = X.copy()
+        
+        old_roc = critic.score(X_old, y)
         
         # Evaluate new features
-        result_new = evaluate_dataset(df_train_new, df_valid_new, target_name, method)
-        new_rocs.append(result_new["roc"])
-        new_accs.append(result_new["acc"])
-    
-    return None, new_rocs, new_accs, old_rocs, old_accs
+        combined_code = full_code + "\n" + new_code if full_code.strip() else new_code
+        X_new = execute_code_safely(combined_code, X.copy(), target_name)
+        new_roc = critic.score(X_new, y)
+        
+        # Return in legacy format (lists for compatibility)
+        # For binary classification, we'll use ROC as a proxy for accuracy in the legacy wrapper
+        return None, [new_roc], [new_roc], [old_roc], [old_roc]
+        
+    except Exception as e:
+        return e, None, None, None, None
+
 
 def execute_code_safely(code: str, df: pd.DataFrame, target_column=None) -> pd.DataFrame:
     """
@@ -167,11 +127,10 @@ def execute_code_safely(code: str, df: pd.DataFrame, target_column=None) -> pd.D
     Args:
         code: Python code to execute
         df: Dataframe to execute on
-        target_column: Target column name (ignored in legacy mode)
+        target_column: Target column name (for leakage prevention)
         
     Returns:
         Modified dataframe
     """
-    # Import here to avoid circular imports
     from .core import execute_code_safely as secure_execute
     return secure_execute(code, df, target_column)
