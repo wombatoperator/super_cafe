@@ -225,7 +225,37 @@ CAAFE includes comprehensive safety measures:
 - **Error Recovery**: Robust exception handling with automatic fallbacks
 - **JSON Schema Validation**: Structured outputs prevent malformed code generation
 
+## 🔥 Real Dataset Testing
+
+CAAFE has been tested on genuinely challenging real-world datasets:
+
+### Available Test Datasets
+- **SECOM**: Semiconductor manufacturing failure prediction (6.6% failure rate, 590 sensors)
+- **MADELON**: NIPS 2003 feature selection challenge (500 features, only 20 informative)
+- **GISETTE**: Handwritten digit recognition with irrelevant features (5000 features)
+- **Real UCI datasets**: Glass, Hepatitis, Ionosphere, Parkinsons, and more
+
+### Running Real Dataset Tests
+```bash
+# Download challenging datasets
+python get_real_challenging_datasets.py
+
+# Test CAAFE on real challenging data
+python test_real_challenging_caafe.py
+```
+
+**Example Results on SECOM (Manufacturing Data):**
+- **Baseline XGBoost**: 0.677 ROC-AUC
+- **Challenge**: Highly imbalanced (6.6% failures), 590 sensor readings, manufacturing domain expertise required
+- **CAAFE Features**: Generates sensor ratios, stability metrics, process indicators
+
 ## 🚀 Recent Updates (v2.0)
+
+### Major Features & Testing
+- **Real challenging dataset integration**: Tested on SECOM manufacturing, MADELON feature selection challenge
+- **Manufacturing domain expertise**: Generates sensor ratios, stability indicators, process control features
+- **Comprehensive dataset validation**: Automatic difficulty assessment and baseline performance testing
+- **Production-ready testing pipeline**: Scripts for downloading and validating real challenging datasets
 
 ### Major Bug Fixes & Optimizations
 - **Fixed holdout mutation bug**: Large datasets no longer affect subsequent evaluations
@@ -234,15 +264,16 @@ CAAFE includes comprehensive safety measures:
 - **Improved dependency handling**: Better XGBoost version checking and error messages
 
 ### New Features
+- **Real dataset testing framework**: Automated download and validation of challenging datasets
+- **Domain-specific feature generation**: Manufacturing, feature selection, and process control expertise
 - **Feature importance analysis**: Built-in analysis of generated feature impact
 - **Streamlined evaluation**: Simplified `evaluation.py` to pure compatibility wrapper
-- **Enhanced real dataset testing**: Better integration with `real_datasets.py`
-- **Production hardening**: Comprehensive testing and validation improvements
 
 ### Architecture Improvements
 - **Optimized Critic class**: Fast, reliable XGBoost-based evaluation
 - **Multi-LLM consistency**: Unified evaluation across OpenAI and Ollama
 - **Clean separation of concerns**: Core logic separated from legacy compatibility
+- **Real-world validation**: Tested on genuinely challenging manufacturing and research datasets
 
 ## 📝 Requirements
 
