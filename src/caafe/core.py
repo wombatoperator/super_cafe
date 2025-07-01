@@ -10,19 +10,10 @@ import ollama
 import os
 import ast
 from sklearn.model_selection import RepeatedKFold, train_test_split
-from sklearn.cluster import KMeans, DBSCAN
-from sklearn.preprocessing import StandardScaler
 from .evaluation import evaluate_dataset
 from .critic import Critic
 from typing import Optional
 from dotenv import load_dotenv
-
-# Optional import for text embeddings
-try:
-    from sentence_transformers import SentenceTransformer
-    SENTENCE_TRANSFORMERS_AVAILABLE = True
-except ImportError:
-    SENTENCE_TRANSFORMERS_AVAILABLE = False
 
 # Load environment variables
 load_dotenv()
@@ -94,108 +85,65 @@ def check_ast(node):
 
 
 def build_prompt(df, target_name, description, iterative=1):
-    """Build a more strategic prompt to encourage novel feature generation."""
-
+    """Build prompt exactly matching CAAFE paper format."""
+    how_many = (
+        "exactly one useful column"  
+    )
+    
     # Create dataframe WITHOUT target column to prevent data leakage
     df_features_only = df.drop(columns=[target_name] if target_name in df.columns else [])
-
-    # Generate column info with samples
+    
+    # Generate column info with samples (exactly like CAAFE format)
     samples = ""
-    # Get a sample, handling cases with fewer than 10 rows
-    sample_size = min(10, len(df_features_only))
-    df_sample = df_features_only.head(sample_size)
+    df_sample = df_features_only.head(10)
     for col in df_sample.columns:
         nan_freq = f"{df_features_only[col].isna().mean() * 100:.1f}"
         sample_values = df_sample[col].tolist()
-
+        
         if str(df_features_only[col].dtype) == "float64":
             sample_values = [round(sample, 2) for sample in sample_values]
-
+        
+        # Format exactly like CAAFE paper
         samples += f"{col} ({df_features_only[col].dtype}): NaN-freq [{nan_freq}%], Samples {sample_values}\n"
+    
+    # Use CAAFE paper prompt format exactly
+    return f"""The dataframe 'df' is loaded and in memory. Columns are also named attributes.
+Description of the dataset in 'df' (column dtypes might be inaccurate):
+"{description}"
 
-    # ==============================================================================
-    # STRATEGY 1: ENHANCED PROMPT
-    # ==============================================================================
-    return f"""You are an expert data scientist and researcher specializing in identifying subtle, non-obvious patterns in data. Your task is to generate a single, highly predictive feature to improve a model's ability to predict "{target_name}".
-
-The dataframe 'df' is loaded and in memory.
-Dataset Description: "{description}"
-
-The model has already been enhanced with basic interaction features. Your goal is to find something more creative.
-
-**Available columns in 'df':**
+Columns in 'df' (true feature dtypes listed here, categoricals encoded as int):
 {samples}
-**Your Thought Process (Chain of Thought):**
-1.  **Hypothesize:** State a novel hypothesis about a hidden grouping or relationship in the data.
-2.  **Choose Method:** Select the best method: a mathematical transformation (ratio, polynomial) OR a clustering algorithm (KMeans, DBSCAN) to test your hypothesis.
-3.  **Explain Usefulness:** Justify why this feature adds new semantic information.
-4.  **Implement:** Provide the Python code.
 
-**RULES:**
--   Your code must be a block of Python creating a new column on the 'df' DataFrame.
--   **CRITICAL: NO IMPORT STATEMENTS ALLOWED! All tools are pre-loaded in your environment.**
--   **Available tools (already imported): `KMeans`, `DBSCAN`, `StandardScaler`, `pd`, `np`**
--   When clustering, always apply `StandardScaler` to the data first.
--   Your code should handle fitting the models and assigning the resulting labels to a new column.
--   Example for clustering (NO imports needed):
-    `scaler = StandardScaler()`
-    `features_to_cluster = df[['Age', 'Fare']]`
-    `scaled_features = scaler.fit_transform(features_to_cluster)`
-    `kmeans = KMeans(n_clusters=4, random_state=42, n_init='auto')`
-    `df['Geo_Cluster'] = kmeans.fit_predict(scaled_features)`
--   **DO NOT** use import statements like `from sklearn.cluster import KMeans` - these tools are already available!
--   **DO NOT** generate simple sum/product features that have already been created.
+This code was written by an expert datascientist working to improve predictions. It is a snippet of code that adds new columns to the dataset.
+Number of samples (rows) in training dataset: {len(df_features_only)}
 
-**Code Formatting:**
+This code generates additional columns that are useful for a downstream classification algorithm (such as XGBoost) predicting "{target_name}".
+Additional columns add new semantic information, that is they use real world knowledge on the dataset. They can e.g. be feature combinations, transformations, aggregations where the new column is a function of the existing columns.
+The scale of columns and offset does not matter. Make sure all used columns exist. Follow the above description of columns closely and consider the datatypes and meanings of classes.
+This code also drops columns, if these may be redundant and hurt the predictive performance of the downstream classifier (Feature selection). Dropping columns may help as the chance of overfitting is lower, especially if the dataset is small.
+The classifier will be trained on the dataset with the generated columns and evaluated on a holdout set. The evaluation metric is accuracy. The best performing code will be selected.
+Added columns can be used in other codeblocks, dropped columns are not available anymore.
+
+Code formatting for each added column:
 ```python
-# HYPOTHESIS: (Your brief hypothesis about a hidden grouping)
-# METHOD: (e.g., "KMeans Clustering" or "Ratio Transformation")
-# USEFULNESS: (Your explanation of why this feature is valuable)
-# Input samples: (Samples of columns used, e.g. 'Age': [22.0, 38.0, 26.0])
-(Your block of pandas/sklearn code to generate the new column)
+# (Feature name and description)
+# Usefulness: (Description why this adds useful real world knowledge to classify "{target_name}" according to dataset description and attributes.)
+# Input samples: (Three samples of the columns used in the following code, e.g. '{df_features_only.columns[0] if len(df_features_only.columns) > 0 else "col1"}': {list(df_features_only.iloc[:3, 0].values) if len(df_features_only) > 0 else [1,2,3]}, '{df_features_only.columns[1] if len(df_features_only.columns) > 1 else "col2"}': {list(df_features_only.iloc[:3, 1].values) if len(df_features_only) > 1 else [4,5,6]}, ...)
+(Some pandas code using '{df_features_only.columns[0] if len(df_features_only.columns) > 0 else "col1"}', '{df_features_only.columns[1] if len(df_features_only.columns) > 1 else "col2"}', ... to add a new column for each row in df)
 ```end
 
-**Your Task:**
-Generate one new feature based on your expert analysis.
+Code formatting for dropping columns:
+```python
+# Explanation why the column XX is dropped
+df.drop(columns=['XX'], inplace=True)
+```end
+
+Each codeblock generates {how_many} and can drop unused columns (Feature selection).
+Each codeblock ends with ```end and starts with "```python"
 
 Codeblock:
 """
 
-
-def generate_text_embeddings(df: pd.DataFrame, text_column: str):
-    """
-    Converts a text column into semantic embeddings.
-    Returns a new DataFrame with embedding features.
-    """
-    if not SENTENCE_TRANSFORMERS_AVAILABLE:
-        raise ImportError("sentence-transformers not available. Install with: pip install sentence-transformers")
-    
-    print(f"\n🧠 Generating semantic embeddings for text column: '{text_column}'...")
-    # Using a small, efficient model perfect for this task
-    model = SentenceTransformer('all-MiniLM-L6-v2')
-    
-    # Ensure text is string and handle potential NaNs
-    corpus = df[text_column].fillna('').astype(str).tolist()
-    
-    # Generate embeddings
-    embeddings = model.encode(corpus, show_progress_bar=True)
-    
-    # Create a new DataFrame for the embeddings
-    embedding_df = pd.DataFrame(embeddings, index=df.index)
-    embedding_df.columns = [f'{text_column}_emb_{i}' for i in range(embeddings.shape[1])]
-    
-    print(f"✅ Generated {embeddings.shape[1]} embedding features.")
-    return embedding_df
-
-
-def encode_categorical_columns(df):
-    """Automatically encode categorical/object columns for XGBoost compatibility.
-    
-    NOTE: We skip encoding here since the Critic's _clean_df() will handle it.
-    This prevents double-encoding which was causing features to be corrupted.
-    """
-    # Let the Critic handle categorical encoding to prevent double-encoding issues
-    return df
 
 
 def execute_code_safely(code, df, target_column=None):
@@ -213,19 +161,8 @@ def execute_code_safely(code, df, target_column=None):
         # Strip comments before checking for target column name to avoid false positives
         import re
         clean_code = re.sub(r"#.*?$", "", code, flags=re.MULTILINE)
-        
-        # Use word boundaries to avoid false positives with substrings
-        # Look for target column used as a pandas column access pattern
-        target_patterns = [
-            rf"\['{target_column}'\]",  # df['target_col']
-            rf'\["{target_column}"\]',  # df["target_col"]
-            rf"\.{target_column}\b",    # df.target_col (if valid identifier)
-            rf"\b{re.escape(target_column)}\b(?=\s*[=,\)\]])"  # target_col as variable/parameter
-        ]
-        
-        for pattern in target_patterns:
-            if re.search(pattern, clean_code):
-                raise ValueError(f"Data leakage detected: code attempts to use target column '{target_column}'")
+        if target_column in clean_code:
+            raise ValueError(f"Data leakage detected: code attempts to use target column '{target_column}'")
     
     # AST security validation
     try:
@@ -243,10 +180,7 @@ def execute_code_safely(code, df, target_column=None):
     local_vars = {
         'df': df_safe,
         'pd': pd,
-        'np': np,
-        'KMeans': KMeans,
-        'DBSCAN': DBSCAN,
-        'StandardScaler': StandardScaler
+        'np': np
     }
     
     safe_builtins = {
@@ -332,9 +266,6 @@ class CAAFE:
         self.generated_features = []
         self.full_code = ""
         self.messages = []
-        self.consecutive_rejections = 0
-        # For complex data, allow it to get stuck before intervening
-        self.MAX_REJECTIONS_BEFORE_META_PROMPT = 2
     
     def generate_features(self, X: pd.DataFrame, y: pd.Series, description: str = "") -> pd.DataFrame:
         """
@@ -535,32 +466,6 @@ Generate exactly ONE feature. Use only pandas operations on existing columns."""
         for i in range(self.max_iterations):
             print(f"*Iteration {i+1}*")
             
-            # === META-PROMPT INTERVENTION LOGIC ===
-            if self.consecutive_rejections >= self.MAX_REJECTIONS_BEFORE_META_PROMPT:
-                print("\n🧠 System is stuck in a loop. Injecting a meta-prompt to force a new strategy...")
-                
-                # Get the last error message for context
-                last_error_msg = "Your last suggestion failed."
-                if len(self.messages) > 1 and "Code execution failed" in self.messages[-1]['content']:
-                    last_error_msg = self.messages[-1]['content']
-
-                meta_prompt = f"""
-CRITICAL FEEDBACK: Your last several suggestions have failed with the error: '{last_error_msg}'
-
-This means your current strategy is fundamentally flawed. DO NOT try the same method again (e.g., KMeans on similar features).
-
-You must propose a COMPLETELY DIFFERENT STRATEGY.
-
-Since the feature names are anonymized, focus on robust mathematical transformations. Propose a new approach:
--   **New Idea 1:** Create a ratio of two features with high variance.
--   **New Idea 2:** Create a polynomial interaction term (`feat_A * feat_B + feat_C**2`).
--   **New Idea 3:** Create a feature that counts how many of a small subset of features are non-zero.
-
-State your new strategy clearly in the HYPOTHESIS, then provide the code.
-"""
-                self.messages.append({"role": "user", "content": meta_prompt})
-                self.consecutive_rejections = 0  # Reset counter after intervention
-            
             try:
                 code = generate_code(self.messages)
             except Exception as e:
@@ -577,46 +482,9 @@ State your new strategy clearly in the HYPOTHESIS, then provide the code.
             
             if error is not None:
                 print(f"Code execution failed with error: {error}")
-                
-                # Get current available columns for better error guidance
-                try:
-                    if self.full_code.strip():
-                        df_current = execute_code_safely(self.full_code, df.drop(columns=[target_name]), target_name)
-                        available_vars = list(df_current.columns)
-                    else:
-                        available_vars = list(df.drop(columns=[target_name]).columns)
-                except:
-                    available_vars = list(df.drop(columns=[target_name]).columns)
-                
-                # Add special handling for import errors
-                if "Import statements are not allowed" in str(error):
-                    error_message = f"""Import error: {error}
-
-CRITICAL: DO NOT use any import statements! The following tools are already available in your environment:
-- KMeans (from sklearn.cluster)
-- DBSCAN (from sklearn.cluster) 
-- StandardScaler (from sklearn.preprocessing)
-- pd (pandas)
-- np (numpy)
-
-Example of correct clustering code (NO IMPORTS NEEDED):
-```python
-scaler = StandardScaler()
-features_to_cluster = df[['feature1', 'feature2']]
-scaled_features = scaler.fit_transform(features_to_cluster)
-kmeans = KMeans(n_clusters=3, random_state=42, n_init='auto')
-df['cluster_feature'] = kmeans.fit_predict(scaled_features)
-```
-
-Available variables: {available_vars}
-Generate next feature WITHOUT any imports:
-```python"""
-                else:
-                    error_message = f"Code execution failed with error: {type(error).__name__}: {error}.\nThis likely means you referenced a variable that doesn't exist or was previously rejected.\nAvailable variables: {available_vars}\nGenerate next feature using only available variables:\n```python"
-                
                 self.messages += [
                     {"role": "assistant", "content": code},
-                    {"role": "user", "content": error_message}
+                    {"role": "user", "content": f"Code execution failed with error: {type(error)} {error}.\nCode: ```python\n{code}\n```\nGenerate next feature (fixing error?):\n```python"}
                 ]
                 continue
             
@@ -642,47 +510,29 @@ Generate next feature WITHOUT any imports:
                 # Tightened acceptance gate
                 add_feature = roc_improvement > epsilon
             else:
-                # Legacy mode: For backward compatibility, but since our wrapper returns ROC for both,
-                # we'll just use ROC improvement to avoid doubling the threshold
+                # Legacy mode: use both ROC and ACC
                 acc_improvement = np.nanmean(new_accs) - np.nanmean(old_accs)
-                decision_metric = roc_improvement  # Use ROC only to avoid doubling effect
+                decision_metric = roc_improvement + acc_improvement
                 
                 # Display results
                 print(f"Performance before adding features ROC {np.nanmean(old_rocs):.3f}, ACC {np.nanmean(old_accs):.3f}.")
                 print(f"Performance after adding features ROC {np.nanmean(new_rocs):.3f}, ACC {np.nanmean(new_accs):.3f}.")
                 print(f"Improvement ROC {roc_improvement:.3f}, ACC {acc_improvement:.3f}.", end=" ")
                 
-                # Legacy acceptance gate - use same threshold as Critic mode
-                epsilon = 0.001
-                add_feature = decision_metric > epsilon
+                # Legacy acceptance gate
+                add_feature = decision_metric > 0
             add_feature_sentence = (
                 "The code was executed and changes to ´df´ were kept." if add_feature
                 else f"The last code changes to ´df´ were discarded. (Improvement: {decision_metric:.3f})"
             )
             print(add_feature_sentence)
             
-            # Update conversation with available variables context
+            # Update conversation
             if len(code) > 10:
-                # Get current available columns (original + accepted features)
-                try:
-                    if self.full_code.strip():
-                        df_current = execute_code_safely(self.full_code, df.drop(columns=[target_name]), target_name)
-                        available_vars = list(df_current.columns)
-                    else:
-                        available_vars = list(df.drop(columns=[target_name]).columns)
-                except:
-                    available_vars = list(df.drop(columns=[target_name]).columns)
-                
                 if using_critic:
-                    if add_feature:
-                        perf_message = f"Performance after adding feature ROC {np.nanmean(new_rocs):.3f}. {add_feature_sentence}\nAvailable variables: {available_vars}\nNext codeblock:"
-                    else:
-                        perf_message = f"Performance after adding feature ROC {np.nanmean(new_rocs):.3f}. {add_feature_sentence}\nAvailable variables: {available_vars}\nGenerate a different feature using only available variables:\nNext codeblock:"
+                    perf_message = f"Performance after adding feature ROC {np.nanmean(new_rocs):.3f}. {add_feature_sentence}\nNext codeblock:"
                 else:
-                    if add_feature:
-                        perf_message = f"Performance after adding feature ROC {np.nanmean(new_rocs):.3f}, ACC {np.nanmean(new_accs):.3f}. {add_feature_sentence}\nAvailable variables: {available_vars}\nNext codeblock:"
-                    else:
-                        perf_message = f"Performance after adding feature ROC {np.nanmean(new_rocs):.3f}, ACC {np.nanmean(new_accs):.3f}. {add_feature_sentence}\nAvailable variables: {available_vars}\nGenerate a different feature using only available variables:\nNext codeblock:"
+                    perf_message = f"Performance after adding feature ROC {np.nanmean(new_rocs):.3f}, ACC {np.nanmean(new_accs):.3f}. {add_feature_sentence}\nNext codeblock:"
                 
                 self.messages += [
                     {"role": "assistant", "content": code},
@@ -692,7 +542,6 @@ Generate next feature WITHOUT any imports:
             # Keep feature if it helps
             if add_feature:
                 self.full_code += "\n" + code
-                self.consecutive_rejections = 0  # Reset on success
                 # Track new features (with target column protection)
                 try:
                     df_temp = execute_code_safely(self.full_code, X.copy(), target_name)
@@ -702,10 +551,6 @@ Generate next feature WITHOUT any imports:
                             self.generated_features.append(feat)
                 except:
                     pass
-            else:
-                self.consecutive_rejections += 1  # Increment on failure
-            
-            print(f"Consecutive rejections: {self.consecutive_rejections}")
             
             print()  # Empty line
         

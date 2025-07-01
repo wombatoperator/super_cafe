@@ -15,6 +15,13 @@ X_enhanced = caafe_openai.generate_features(
     description="Customer churn prediction with demographic and behavioral features"
 )
 
+# Gemini 2.5 Pro (Google AI - reasoning model)
+caafe_gemini = CAAFE(
+    provider="gemini",
+    model="gemini-2.5-pro"  # Top-tier reasoning model
+)
+X_enhanced = caafe_gemini.generate_features(X, y, description)
+
 # Ollama (local model)
 caafe_local = CAAFE(
     provider="ollama",
@@ -31,7 +38,7 @@ model.fit(X_enhanced, y)
 
 ## ✨ Key Features
 
-- **Multi-LLM Support**: Use OpenAI (cloud) or Ollama (local) models
+- **Multi-LLM Support**: Use OpenAI, Gemini 2.5 Pro (reasoning), or Ollama (local) models
 - **XGBoost Optimized**: Prompts designed specifically for gradient boosting
 - **Data Leakage Protection**: Prevents target column access during feature generation
 - **Optimized Evaluation**: Fast XGBoost Critic with pre-tuned hyperparameters
@@ -43,7 +50,7 @@ model.fit(X_enhanced, y)
 
 ```bash
 # Install dependencies
-pip install pandas xgboost scikit-learn openai ollama python-dotenv
+pip install pandas xgboost scikit-learn openai ollama google-genai python-dotenv
 
 # Clone and use
 git clone <this-repo>
@@ -51,6 +58,9 @@ cd caafe_2
 
 # For OpenAI (optional)
 export OPENAI_API_KEY="your-openai-api-key"
+
+# For Gemini 2.5 Pro (recommended - best reasoning)
+export GEMINI_API_KEY="your-gemini-api-key"
 
 # For Ollama (install and start server)
 ollama serve

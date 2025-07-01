@@ -1,0 +1,42 @@
+{
+  "version": "1.0",
+  "created": "2025-06-30T20:01:45.050328",
+  "features": [
+    {
+      "code": "# (Family_Size: Total number of family members on board, including the passenger.)\n# Usefulness: (This feature combines the number of siblings/spouses ('SibSp') and parents/children ('Parch') to create a total family size. The size of a passenger's family unit is a strong indicator of survival. Small families might have been able to coordinate and help each other, while very large families might have been difficult to manage during the evacuation. Lone travelers had different survival patterns as well. This feature provides a more holistic view of a passenger's social support system on the ship than 'SibSp' and 'Parch' individually.)\n# Input samples: ({'SibSp': [1, 0, 0], 'Parch': [0, 0, 0]})\ndf['Family_Size'] = df['SibSp'] + df['Parch'] + 1",
+      "description": "(Family_Size: Total number of family members on board, including the passenger.)",
+      "feature_name": "Family_Size",
+      "improvement_score": 0.0014110442817294455,
+      "baseline_score": 0.859206110529986,
+      "dataset_context": "titanic passenger survival",
+      "dataset_size": 891,
+      "dataset_features": 8,
+      "timestamp": "2025-06-30T19:47:18.887127",
+      "tags": [
+        "gemini",
+        "streamlined_caafe"
+      ],
+      "relative_improvement": 0.0016422651846121857,
+      "success_rank": "moderate",
+      "code_hash": "8fc0e853"
+    },
+    {
+      "code": "# (Fare_per_Person: The fare paid per individual in a family group.)\n# Usefulness: (The 'Fare' column represents the total fare paid for a ticket, which might cover multiple people (a family). Dividing the fare by the number of people in the family (Family_Size = SibSp + Parch + 1) gives a more accurate measure of the economic status and the value placed on an individual's passage. This normalized wealth indicator could be a stronger predictor of survival than the raw fare, as it controls for the confounding effect of family size on the ticket price. Passengers with a higher fare per person might have had better accommodations or priority access to lifeboats.)\n# Input samples: ({'Fare': [53.1, 8.05, 7.88], 'SibSp': [1, 0, 0], 'Parch': [0, 0, 0]})\nfamily_size = df['SibSp'] + df['Parch'] + 1\ndf['Fare_per_Person'] = df['Fare'] / family_size",
+      "description": "(Fare_per_Person: The fare paid per individual in a family group.)",
+      "feature_name": "Fare_per_Person",
+      "improvement_score": 0.006499520571827233,
+      "baseline_score": 0.859206110529986,
+      "dataset_context": "titanic passenger survival",
+      "dataset_size": 891,
+      "dataset_features": 8,
+      "timestamp": "2025-06-30T20:01:45.050280",
+      "tags": [
+        "gemini",
+        "streamlined_caafe"
+      ],
+      "relative_improvement": 0.007564565116765894,
+      "success_rank": "good",
+      "code_hash": "620806b5"
+    }
+  ]
+}
