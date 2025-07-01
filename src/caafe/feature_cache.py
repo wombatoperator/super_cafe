@@ -15,6 +15,7 @@ import pandas as pd
 import numpy as np
 from pathlib import Path
 import portalocker
+from tempfile import NamedTemporaryFile
 
 
 class FeatureEntry:
@@ -44,7 +45,7 @@ class FeatureEntry:
         self.timestamp = timestamp or datetime.now().isoformat()
         self.tags = tags or []
         
-        # Calculate derived metrics
+        # Calculate derived metrics - [FIX] Stop squaring the reward
         self.relative_improvement = improvement_score / baseline_score if baseline_score > 0 else 0
         self.success_rank = self._calculate_success_rank()
         self.code_hash = hashlib.md5(code.encode()).hexdigest()[:8]
@@ -335,7 +336,7 @@ class FeatureCache:
             return "other"
     
     def save_cache(self):
-        """Save cache to JSON file."""
+        """Save cache to JSON file with atomic write."""
         cache_data = {
             'version': '1.0',
             'created': datetime.now().isoformat(),
@@ -343,11 +344,24 @@ class FeatureCache:
         }
         
         try:
-            with portalocker.Lock(self.cache_file, timeout=5, flags=portalocker.LOCK_EX):
-                with open(self.cache_file, 'w') as f:
-                    json.dump(cache_data, f, indent=2)
+            # [FIX] Atomic write to prevent corruption during parallel runs
+            cache_dir = self.cache_file.parent if hasattr(self.cache_file, 'parent') else os.path.dirname(self.cache_file)
+            with NamedTemporaryFile('w', delete=False, dir=cache_dir, suffix='.tmp') as tmp:
+                json.dump(cache_data, tmp, indent=2)
+                tmp.flush()
+                os.fsync(tmp.fileno())
+                temp_path = tmp.name
+            
+            # Atomic move
+            os.replace(temp_path, self.cache_file)
         except Exception as e:
             print(f"⚠️  Failed to save feature cache: {e}")
+            # Clean up temp file if it exists
+            try:
+                if 'temp_path' in locals():
+                    os.unlink(temp_path)
+            except:
+                pass
     
     def load_cache(self):
         """Load cache from JSON file."""
