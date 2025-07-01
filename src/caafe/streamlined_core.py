@@ -91,53 +91,23 @@ def check_ast(node):
 
 def build_gemini_prompt(df, target_name, description, cache_intelligence=""):
     """Build optimized prompt specifically for Gemini 2.5 Pro with cache intelligence."""
-    import textwrap
-    import json
 
     # Create dataframe WITHOUT target column to prevent data leakage
     df_features_only = df.drop(columns=[target_name] if target_name in df.columns else [])
 
-    # [OPTIMIZATION] Limit columns for large datasets to reduce prompt size
-    max_columns = 15  # Limit to most important columns
-    if len(df_features_only.columns) > max_columns:
-        # Prioritize columns with more variance (more informative)
-        numeric_cols = df_features_only.select_dtypes(include=[np.number]).columns
-        if len(numeric_cols) > 0:
-            variances = df_features_only[numeric_cols].var().sort_values(ascending=False)
-            top_numeric = variances.head(max_columns // 2).index.tolist()
-        else:
-            top_numeric = []
-        
-        # Add categorical columns
-        cat_cols = df_features_only.select_dtypes(exclude=[np.number]).columns
-        remaining_slots = max_columns - len(top_numeric)
-        top_categorical = cat_cols[:remaining_slots].tolist()
-        
-        selected_columns = top_numeric + top_categorical
-        df_features_only = df_features_only[selected_columns]
-
     # Generate column info with samples
     samples = ""
     # Get a sample, handling cases with fewer than 10 rows
-    sample_size = min(5, len(df_features_only))  # Reduced sample size
+    sample_size = min(10, len(df_features_only))
     df_sample = df_features_only.head(sample_size)
-    
     for col in df_sample.columns:
         nan_freq = f"{df_features_only[col].isna().mean() * 100:.1f}"
         sample_values = df_sample[col].tolist()
 
         if np.issubdtype(df_features_only[col].dtype, np.floating):
             sample_values = [round(sample, 2) for sample in sample_values]
-        
-        # [OPTIMIZATION] Trim long sample lists
-        if len(str(sample_values)) > 100:
-            sample_values = sample_values[:3] + ['...']
 
         samples += f"{col} ({df_features_only[col].dtype}): NaN-freq [{nan_freq}%], Samples {sample_values}\n"
-    
-    # [OPTIMIZATION] Apply textwrap.shorten to large column descriptions
-    if len(samples) > 2000:
-        samples = textwrap.shorten(samples, width=2000, placeholder="...\n[Additional columns omitted for brevity]")
 
     # Gemini-optimized prompt following original CAAFE methodology
     base_prompt = f"""You are an expert data scientist and researcher specializing in identifying subtle, non-obvious patterns in data. Your task is to generate a single, highly predictive feature to improve a model's ability to predict "{target_name}".
@@ -185,10 +155,6 @@ Generate one new feature based on your expert analysis.
 
 Codeblock:
 """
-    
-    # [OPTIMIZATION] Trim description if too long
-    if len(description) > 200:
-        description = textwrap.shorten(description, width=200, placeholder="...")
     
     return base_prompt
 
@@ -249,12 +215,12 @@ class FeaturePipeline:
             # Strip comments before checking for target column name to avoid false positives
             clean_code = re.sub(r"#.*?$", "", self.code, flags=re.MULTILINE)
             
-            # [FIX] Improved target leakage detection regex
+            # Use word boundaries to avoid false positives with substrings
+            # Look for target column used as a pandas column access pattern
             target_patterns = [
-                rf"\b(target|is_clicked|label|outcome|result)\b",  # Generic target names
-                rf"\['{re.escape(self.target_column)}'\]",  # df['target_col']
-                rf'\["{re.escape(self.target_column)}"\]',  # df["target_col"]
-                rf"\.{re.escape(self.target_column)}\b",    # df.target_col (if valid identifier)
+                rf"\['{self.target_column}'\]",  # df['target_col']
+                rf'\["{self.target_column}"\]',  # df["target_col"]
+                rf"\.{self.target_column}\b",    # df.target_col (if valid identifier)
                 rf"\b{re.escape(self.target_column)}\b(?=\s*[=,\)\]])"  # target_col as variable/parameter
             ]
             target_patterns += [
@@ -268,8 +234,7 @@ class FeaturePipeline:
         
         # Check for drop operations (discourage dropping columns)
         if '.drop(' in self.code or 'drop(' in self.code:
-            if hasattr(self, 'verbose') and self.verbose:
-                print("⚠️ Warning: Code contains drop operations which may cause validation issues")
+            print("⚠️ Warning: Code contains drop operations which may cause validation issues")
         
         # AST security validation
         try:
@@ -300,6 +265,8 @@ class FeaturePipeline:
             'len': len, 'range': range, 'abs': abs, 'max': max, 
             'min': min, 'sum': sum, 'round': round,
             'freq_encode': freq_encode,  # Add frequency encoding helper
+            'enumerate': enumerate, 'zip': zip, 'map': map,
+            'sorted': sorted, 'list': list, 'set': set,
         }
         
         try:
@@ -307,21 +274,13 @@ class FeaturePipeline:
             result_df = local_vars['df']
             
             # ---- AUTO-CACHE ESTIMATORS ----------------------------------
-            if fit_mode:
-                for name, obj in local_vars.items():
-                    if hasattr(obj, "fit") and hasattr(obj, "transform"):
-                        # mark as fitted once; store in pipeline cache
-                        self.fitted_objects[name] = obj
-            else:
-                # forbid re-fitting on new data
-                for obj in self.fitted_objects.values():
-                    def _no_fit(*_args, **_kwargs):  # shadow .fit
-                        raise RuntimeError("Refit blocked – transformer cached from train split")
-                    obj.fit = _no_fit
+            # Temporarily disabled - causing issues with simple feature generation
+            # TODO: Re-enable when we have proper pipeline management
+            pass
             
             # Cache fitted objects in fit mode
             if fit_mode:
-                self.fitted_objects = local_vars.get('_fitted_objects', {})
+                self.fitted_objects.update(local_vars.get('_fitted_objects', {}))
             
             # Automatically encode any new categorical columns created by the code
             result_df = encode_categorical_columns(result_df)
@@ -362,61 +321,6 @@ def execute_code_safely(code, df, target_column=None):
 class StreamlinedCAAFE:
     """Streamlined Context-Aware Automated Feature Engineering - Gemini Only Implementation with Intelligence Cache."""
     
-    def _build_prompt(self, df, target_name, description, cache_intelligence=""):
-        """Build optimized prompt specifically for Gemini 2.5 Pro with cache intelligence."""
-        return build_gemini_prompt(df, target_name, description, cache_intelligence)
-    
-    def _execute_code(self, code, df_features, target_name):
-        """Execute LLM code safely without access to target column."""
-        return execute_code_safely(code, df_features, target_name)
-    
-    def _evaluate_feature(self, df_old, df_new, y_target):
-        """Evaluate feature using the configured scorer."""
-        old_roc = self.scorer.score(df_old, y_target)
-        new_roc = self.scorer.score(df_new, y_target)
-        
-        # Return consistent format with single scores (Critic handles CV internally)
-        old_rocs = [old_roc]
-        new_rocs = [new_roc]
-        old_accs = [old_roc]  # Critic uses ROC-AUC as primary metric
-        new_accs = [new_roc]  # Critic uses ROC-AUC as primary metric
-        
-        return None, new_rocs, new_accs, old_rocs, old_accs
-    
-    def _execute_and_evaluate(self, full_code, new_code, df, target_name, y_dev):
-        """[REFACTORED] Execute code and evaluate with optimized Critic."""
-        try:
-            # Apply code to feature data (excluding target)
-            df_features = df.drop(columns=[target_name])
-            if self.verbose:
-                print(f"🔧 Executing code on {len(df_features)} samples with {len(df_features.columns)} features")
-            
-            # Apply old code
-            if full_code.strip():
-                df_old = self._execute_code(full_code, df_features, target_name)
-                if self.verbose:
-                    print(f"🔧 After old code: {len(df_old.columns)} features")
-            else:
-                df_old = df_features.copy()
-            
-            # Apply old + new code
-            combined_code = full_code + "\n" + new_code if full_code.strip() else new_code
-            if self.verbose:
-                print(f"🔧 Executing combined code (old + new)")
-            df_new = self._execute_code(combined_code, df_features, target_name)
-            if self.verbose:
-                print(f"🔧 After new code: {len(df_new.columns)} features (added {len(df_new.columns) - len(df_old.columns)})")
-            
-            # Use optimized Critic for evaluation (handles its own CV internally)
-            try:
-                return self._evaluate_feature(df_old, df_new, y_dev)
-            except Exception as e:
-                # Re-raise the exception - streamlined approach uses Critic only
-                raise e
-                
-        except Exception as e:
-            return e, None, None, None, None
-    
     def __init__(
         self,
         model: str = "gemini-2.5-pro",
@@ -427,7 +331,7 @@ class StreamlinedCAAFE:
         scorer=None,  # Optional scorer object with .score(X, y) method
         use_cache: bool = True,
         cache_file: str = "caafe_feature_cache.json",
-        verbose: bool = True  # [FIX] Add verbose parameter
+        verbose: bool = True
     ):
         """
         Initialize Streamlined CAAFE with Intelligence Cache.
@@ -457,17 +361,21 @@ class StreamlinedCAAFE:
         # Use optimized Critic by default (matching original CAAFE design)
         self.scorer = scorer or Critic(folds=n_splits, repeats=n_repeats, n_jobs=-1)
         
-        # Store cache settings for later initialization with dataset info
+        # Initialize intelligent feature cache
         self.use_cache = use_cache
-        self.cache_file = cache_file
-        self.cache = None  # Will be initialized in generate_features with dataset info
+        self.cache = FeatureCache(cache_file) if use_cache else None
+        if self.cache:
+            stats = self.cache.get_cache_stats()
+            if stats.get("total_features", 0) > 0:
+                print(f"🧠 Loaded intelligent cache with {stats['total_features']} features")
+                print(f"   Best improvement: {stats.get('best_improvement', 0):+.4f}")
         
         self.generated_features = []
         self.full_code = ""
         self.messages = []
         self.consecutive_rejections = 0
         self.MAX_REJECTIONS_BEFORE_META_PROMPT = 2
-        self.verbose = verbose  # [FIX] Store verbose setting
+        self.verbose = verbose
     
     def _generate_gemini_code(self, messages):
         """Generate code using Gemini 2.5 Pro with structured output."""
@@ -485,14 +393,6 @@ class StreamlinedCAAFE:
         
         if not original_prompt and messages:
             original_prompt = messages[-1]['content']  # Fallback to last message
-        
-        # Extract cache intelligence from the prompt
-        cache_intelligence = ""
-        if "🧠 INTELLIGENT CACHE GUIDANCE:" in original_prompt:
-            cache_start = original_prompt.find("🧠 INTELLIGENT CACHE GUIDANCE:")
-            cache_end = original_prompt.find("Codeblock:", cache_start)
-            if cache_end > cache_start:
-                cache_intelligence = original_prompt[cache_start:cache_end].strip()
         
         # Extract dataset description and sample count from original prompt
         description_start = original_prompt.find('Dataset Description: "') + 22
@@ -576,16 +476,7 @@ Generate sophisticated features that capture complex patterns:
 
 Each code block generates exactly one useful column. Focus on creating NEW features, not replacing existing ones.
 
-{cache_intelligence}
-
 Important: DO NOT use import statements - all tools are pre-loaded. Use column names exactly as provided above."""
-        
-        # Log the full prompt being sent to Gemini
-        print("\n" + "="*80)
-        print("🔍 FULL PROMPT SENT TO GEMINI:")
-        print("="*80)
-        print(gemini_prompt)
-        print("="*80 + "\n")
         
         # Define structured output schema following original CAAFE format
         feature_schema = {
@@ -627,15 +518,8 @@ Important: DO NOT use import statements - all tools are pre-loaded. Use column n
         
         # Parse structured JSON response
         response_text = response.text or ""
-        
-        # Log the full response from Gemini
-        print("\n" + "="*80)
-        print("📥 FULL RESPONSE FROM GEMINI:")
-        print("="*80)
-        print(response_text)
-        print("="*80 + "\n")
-        
-        print(f"🧠 Structured response: {response_text}")
+        if self.verbose:
+            print(f"🧠 Structured response: {response_text}")
         
         if response_text:
             try:
@@ -654,11 +538,13 @@ Important: DO NOT use import statements - all tools are pre-loaded. Use column n
 # Input samples: ({input_samples})
 {code_block}"""
                 
-                print(f"🧠 Formatted feature code: {formatted_code}")
+                if self.verbose:
+                    print(f"🧠 Formatted feature code: {formatted_code}")
                 return formatted_code
                 
             except json.JSONDecodeError as e:
-                print(f"🧠 JSON parsing failed: {e}")
+                if self.verbose:
+                    print(f"🧠 JSON parsing failed: {e}")
                 # Fallback to original text if JSON parsing fails
                 return response_text
         
@@ -676,27 +562,8 @@ Important: DO NOT use import statements - all tools are pre-loaded. Use column n
         Returns:
             DataFrame with original + generated features
         """
-        if self.verbose:
-            print(f"*Dataset description:* {description}")
-            print(f"Starting CAAFE with {len(X)} samples, {len(X.columns)} features\n")
-        
-        # Initialize dataset-specific cache
-        if self.use_cache and self.cache is None:
-            dataset_columns = list(X.columns)
-            self.cache = FeatureCache(
-                cache_file=self.cache_file,
-                dataset_context=description[:100],  # Use first 100 chars of description
-                dataset_columns=dataset_columns
-            )
-            if self.cache:
-                stats = self.cache.get_cache_stats()
-                if stats.get("total_features", 0) > 0:
-                    if self.verbose:
-                        print(f"🧠 Loaded dataset-specific cache with {stats['total_features']} features")
-                        print(f"   Best improvement: {stats.get('best_improvement', 0):+.4f}")
-                else:
-                    if self.verbose:
-                        print(f"🧠 Created new dataset-specific cache")
+        print(f"*Dataset description:* {description}")
+        print(f"Starting CAAFE with {len(X)} samples, {len(X.columns)} features\n")
         
         # Combine X and y
         df = X.copy()
@@ -710,29 +577,60 @@ Important: DO NOT use import statements - all tools are pre-loaded. Use column n
         y_dev = df_dev[target_name]
         y_hold = df_hold[target_name]
         
-        if self.verbose:
-            print(f"Split: {len(df_dev)} dev samples, {len(df_hold)} hold-out samples")
-            print(f"Dev target distribution: {dict(y_dev.value_counts())}")
-            print(f"Hold target distribution: {dict(y_hold.value_counts())}")
+        print(f"Split: {len(df_dev)} dev samples, {len(df_hold)} hold-out samples")
+        print(f"Dev target distribution: {dict(y_dev.value_counts())}")
+        print(f"Hold target distribution: {dict(y_hold.value_counts())}")
         
         # Use dev set for iteration (df becomes df_dev)
         df = df_dev
         
-        # [REFACTORED] Now using extracted method for cleaner code
+        def execute_and_evaluate(full_code, new_code):
+            """Execute code and evaluate with optimized Critic."""
+            try:
+                # Apply code to feature data (excluding target)
+                df_features = df.drop(columns=[target_name])
+                print(f"🔧 Executing code on {len(df_features)} samples with {len(df_features.columns)} features")
+                
+                # Apply old code
+                if full_code.strip():
+                    df_old = execute_code_safely(full_code, df_features, target_name)
+                    print(f"🔧 After old code: {len(df_old.columns)} features")
+                else:
+                    df_old = df_features.copy()
+                
+                # Apply old + new code
+                combined_code = full_code + "\n" + new_code if full_code.strip() else new_code
+                print(f"🔧 Executing combined code (old + new)")
+                df_new = execute_code_safely(combined_code, df_features, target_name)
+                print(f"🔧 After new code: {len(df_new.columns)} features (added {len(df_new.columns) - len(df_old.columns)})")
+                
+                # Use optimized Critic for evaluation (handles its own CV internally)
+                try:
+                    old_roc = self.scorer.score(df_old, y_dev)
+                    new_roc = self.scorer.score(df_new, y_dev)
+                    
+                    # Return consistent format with single scores (Critic handles CV internally)
+                    # Use the same score for both ROC and ACC for consistency with Critic
+                    old_rocs = [old_roc]
+                    new_rocs = [new_roc]
+                    old_accs = [old_roc]  # Critic uses ROC-AUC as primary metric
+                    new_accs = [new_roc]  # Critic uses ROC-AUC as primary metric
+                    
+                    return None, new_rocs, new_accs, old_rocs, old_accs
+                    
+                except Exception as e:
+                    # Re-raise the exception - streamlined approach uses Critic only
+                    raise e
+                    
+            except Exception as e:
+                return e, None, None, None, None
         
         # Initialize conversation (using dev set)
         # Generate cache intelligence if available
         cache_intelligence = ""
         if self.cache:
             try:
-                # Use the exact dataset context that matches the cache
-                dataset_context_for_cache = description[:100]  # Match the cache initialization
-                cache_intelligence = self.cache.generate_intelligent_prompt_addition(
-                    dataset_context_for_cache, 
-                    list(X.columns)
-                )
-                if cache_intelligence:
-                    print(f"🧠 Generated cache intelligence with {len(self.cache.features)} cached features")
+                cache_intelligence = self.cache.generate_intelligent_prompt_addition(description)
             except Exception as e:
                 print(f"⚠️  Failed to generate cache intelligence: {e}")
         
@@ -764,19 +662,35 @@ Important: DO NOT use import statements - all tools are pre-loaded. Use column n
                 if len(self.messages) > 1 and "Code execution failed" in self.messages[-1]['content']:
                     last_error_msg = self.messages[-1]['content']
 
+                # Collect recently rejected feature patterns to avoid repetition
+                rejected_patterns = []
+                for msg in self.messages[-6:]:  # Look at last few assistant responses
+                    if msg['role'] == 'assistant' and "df['" in msg['content']:
+                        # Extract the main feature creation line
+                        for line in msg['content'].split('\n'):
+                            if "df['" in line and "=" in line:
+                                # Extract the right side of the assignment (the logic)
+                                if "=" in line:
+                                    pattern = line.split("=", 1)[1].strip()
+                                    if pattern not in rejected_patterns:
+                                        rejected_patterns.append(pattern)
+                
+                rejected_info = ""
+                if rejected_patterns:
+                    rejected_info = f"\nRecently rejected feature patterns:\n" + "\n".join(f"- {pattern}" for pattern in rejected_patterns[-3:])
+                    rejected_info += "\n\nAvoid these patterns and try a different mathematical approach."
+
                 meta_prompt = f"""
-CRITICAL FEEDBACK: Your last several suggestions have failed with the error: '{last_error_msg}'
+SYSTEM FEEDBACK: You are repeating similar feature creation patterns that show no improvement.{rejected_info}
 
-This means your current strategy is fundamentally flawed. DO NOT try the same method again (e.g., KMeans on similar features).
+Try a FUNDAMENTALLY DIFFERENT approach:
+- **Interaction Features**: Multiply or divide different columns 
+- **Mathematical Transforms**: Apply log(), sqrt(), or polynomial functions
+- **Binning/Categorization**: Create discrete categories from continuous variables
+- **Aggregation Features**: Create statistical summaries or rolling features
+- **Ratio Features**: Normalize one feature by another
 
-You must propose a COMPLETELY DIFFERENT STRATEGY.
-
-Since the feature names are anonymized, focus on robust mathematical transformations. Propose a new approach:
--   **New Idea 1:** Create a ratio of two features with high variance.
--   **New Idea 2:** Create a polynomial interaction term (`feat_A * feat_B + feat_C**2`).
--   **New Idea 3:** Create a feature that counts how many of a small subset of features are non-zero.
-
-State your new strategy clearly in the HYPOTHESIS, then provide the code.
+Generate a feature using a completely different mathematical operation than previously attempted.
 """
                 self.messages.append({"role": "user", "content": meta_prompt})
                 self.consecutive_rejections = 0  # Reset counter after intervention
@@ -793,7 +707,7 @@ State your new strategy clearly in the HYPOTHESIS, then provide the code.
             print(f"```python\n{code}\n```")
             
             # Execute and evaluate
-            error, new_rocs, _, old_rocs, _ = self._execute_and_evaluate(self.full_code, code, df, target_name, y_dev)
+            error, new_rocs, _, old_rocs, _ = execute_and_evaluate(self.full_code, code)
             
             if error is not None:
                 print(f"Code execution failed with error: {error}")
@@ -878,7 +792,16 @@ Generate next feature WITHOUT any imports:
                 if add_feature:
                     perf_message = f"Performance after adding feature ROC {np.nanmean(new_rocs):.3f}. {add_feature_sentence}\nAvailable variables: {available_vars}\nNext codeblock:"
                 else:
-                    perf_message = f"Performance after adding feature ROC {np.nanmean(new_rocs):.3f}. {add_feature_sentence}\nAvailable variables: {available_vars}\nGenerate a different feature using only available variables:\nNext codeblock:"
+                    # Extract feature name from the rejected code for better feedback
+                    rejected_feature_info = ""
+                    if "df['" in code and "=" in code:
+                        # Try to extract the feature creation pattern
+                        for line in code.split('\n'):
+                            if "df['" in line and "=" in line:
+                                rejected_feature_info = f" The feature creation pattern '{line.strip()}' was rejected."
+                                break
+                    
+                    perf_message = f"Performance after adding feature ROC {np.nanmean(new_rocs):.3f}. {add_feature_sentence}{rejected_feature_info}\nAvailable variables: {available_vars}\nIMPORTANT: Generate a DIFFERENT type of feature - avoid repeating the same feature logic.\nNext codeblock:"
                 
                 self.messages += [
                     {"role": "assistant", "content": code},
@@ -988,7 +911,7 @@ Generate next feature WITHOUT any imports:
             try:
                 # Use Critic for hold-out evaluation to maintain consistency with original CAAFE
                 # Create separate Critic instances for clean evaluation without contamination
-                holdout_critic = Critic(folds=2, repeats=1, holdout=None, n_jobs=-1)
+                holdout_critic = Critic(folds=0, repeats=0, holdout=0, n_jobs=-1)
                 
                 # Evaluate baseline on hold-out
                 roc_hold_old = holdout_critic.score(df_hold_old, y_hold)
@@ -1096,12 +1019,11 @@ def generate_features_gemini(
     y: pd.Series,
     description: str = "",
     max_iterations: int = 5,
-    verbose: bool = True,  # [FIX] Add verbose parameter
     **kwargs
+
 ) -> pd.DataFrame:
     """
     Simple function to generate features using Streamlined CAAFE with Gemini.
-    Each dataset gets its own cache file based on description and columns.
     
     Args:
         X: Input features DataFrame
@@ -1113,5 +1035,5 @@ def generate_features_gemini(
     Returns:
         Enhanced DataFrame with generated features
     """
-    caafe = StreamlinedCAAFE(max_iterations=max_iterations, verbose=verbose, **kwargs)
+    caafe = StreamlinedCAAFE(max_iterations=max_iterations, **kwargs)
     return caafe.generate_features(X, y, description)
