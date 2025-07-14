@@ -173,5 +173,5 @@ def execute_code_safely(code: str, df: pd.DataFrame, target_column=None) -> pd.D
         Modified dataframe
     """
     # Import here to avoid circular imports
-    from .core import execute_code_safely as secure_execute
+    from .streamlined_core import execute_code_safely as secure_execute
     return secure_execute(code, df, target_column)

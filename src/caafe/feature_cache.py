@@ -1,372 +1,378 @@
 """
-CAAFE Feature Cache System
-==========================
+SUPER CAAFE Feature Cache: Intelligent Feature Learning System
+==============================================================
 
-Intelligent caching system that stores successful features and learns from past experiments
-to make future feature generation more effective.
+Implements in-context learning through intelligent caching of successful features.
+Provides atomic operations, semantic matching, and cross-dataset learning.
 """
 
 import json
 import os
 import hashlib
+import tempfile
 from datetime import datetime
-from typing import List, Dict, Optional, Tuple
-import pandas as pd
-import numpy as np
 from pathlib import Path
-import portalocker
-from tempfile import NamedTemporaryFile
+from typing import List, Dict, Optional, Tuple
+import numpy as np
+from dataclasses import dataclass, asdict
 
 
-class FeatureEntry:
-    """Represents a single cached feature with its metadata and performance."""
+@dataclass
+class FeatureMetadata:
+    """Metadata for a successfully validated feature."""
     
-    def __init__(
-        self,
-        code: str,
-        description: str,
-        feature_name: str,
-        improvement_score: float,
-        baseline_score: float,
-        dataset_context: str,
-        dataset_size: int,
-        dataset_features: int,
-        timestamp: Optional[str] = None,
-        tags: Optional[List[str]] = None
-    ):
-        self.code = code
-        self.description = description
-        self.feature_name = feature_name
-        self.improvement_score = improvement_score
-        self.baseline_score = baseline_score
-        self.dataset_context = dataset_context
-        self.dataset_size = dataset_size
-        self.dataset_features = dataset_features
-        self.timestamp = timestamp or datetime.now().isoformat()
-        self.tags = tags or []
+    code: str
+    description: str
+    feature_name: str
+    improvement: float
+    baseline_roc: float
+    enhanced_roc: float
+    dataset_hash: str
+    dataset_context: str
+    dataset_size: int
+    dataset_features: int
+    timestamp: str
+    feature_type: str
+    complexity: str  # simple, moderate, complex
+    
+    @property
+    def relative_improvement(self) -> float:
+        """Calculate relative improvement percentage."""
+        if self.baseline_roc > 0:
+            return (self.improvement / self.baseline_roc) * 100
+        return 0.0
+    
+    @property
+    def impact_score(self) -> float:
+        """
+        Compute an impact score combining absolute and relative improvement.
+        Higher scores indicate more valuable features.
+        """
+        # Weight absolute improvement more for weak baselines
+        # Weight relative improvement more for strong baselines
+        baseline_weight = 1 - self.baseline_roc
+        relative_weight = self.baseline_roc
         
-        # Calculate derived metrics - [FIX] Stop squaring the reward
-        self.relative_improvement = improvement_score / baseline_score if baseline_score > 0 else 0
-        self.success_rank = self._calculate_success_rank()
-        self.code_hash = hashlib.md5(code.encode()).hexdigest()[:8]
+        return (baseline_weight * self.improvement * 10 + 
+                relative_weight * self.relative_improvement / 10)
     
-    def _calculate_success_rank(self) -> str:
-        """Categorize the success level of this feature."""
-        if self.improvement_score >= 0.02:
-            return "exceptional"  # 2%+ improvement
-        elif self.improvement_score >= 0.01:
-            return "excellent"   # 1-2% improvement
-        elif self.improvement_score >= 0.005:
-            return "good"        # 0.5-1% improvement
-        elif self.improvement_score >= 0.001:
-            return "moderate"    # 0.1-0.5% improvement
-        else:
-            return "minimal"     # <0.1% improvement
-    
-    def to_dict(self) -> Dict:
+    def to_dict(self) -> dict:
         """Convert to dictionary for JSON serialization."""
-        return {
-            'code': self.code,
-            'description': self.description,
-            'feature_name': self.feature_name,
-            'improvement_score': self.improvement_score,
-            'baseline_score': self.baseline_score,
-            'dataset_context': self.dataset_context,
-            'dataset_size': self.dataset_size,
-            'dataset_features': self.dataset_features,
-            'timestamp': self.timestamp,
-            'tags': self.tags,
-            'relative_improvement': self.relative_improvement,
-            'success_rank': self.success_rank,
-            'code_hash': self.code_hash
-        }
+        data = asdict(self)
+        data['relative_improvement'] = self.relative_improvement
+        data['impact_score'] = self.impact_score
+        return data
     
     @classmethod
-    def from_dict(cls, data: Dict) -> 'FeatureEntry':
-        """Create FeatureEntry from dictionary."""
-        return cls(
-            code=data['code'],
-            description=data['description'],
-            feature_name=data['feature_name'],
-            improvement_score=data['improvement_score'],
-            baseline_score=data['baseline_score'],
-            dataset_context=data['dataset_context'],
-            dataset_size=data['dataset_size'],
-            dataset_features=data['dataset_features'],
-            timestamp=data.get('timestamp'),
-            tags=data.get('tags', [])
-        )
+    def from_dict(cls, data: dict) -> 'FeatureMetadata':
+        """Create from dictionary."""
+        # Remove computed properties if present
+        data.pop('relative_improvement', None)
+        data.pop('impact_score', None)
+        return cls(**data)
 
 
 class FeatureCache:
-    """Intelligent cache for storing and retrieving successful features."""
+    """
+    Intelligent cache for storing and retrieving successful features.
     
-    def __init__(self, cache_file: str = "caafe_feature_cache.json", dataset_context: str = None, dataset_columns: List[str] = None):
-        # Generate dataset-specific cache file if context provided
-        if dataset_context and dataset_columns:
-            dataset_hash = self._generate_dataset_hash(dataset_context, dataset_columns)
-            cache_dir = Path(cache_file).parent
-            cache_name = f"caafe_cache_{dataset_hash}.json"
-            self.cache_file = cache_dir / cache_name
-            print(f"🗂️  Using dataset-specific cache: {cache_name}")
-        else:
-            self.cache_file = Path(cache_file)
+    Implements:
+    - Atomic file operations for crash safety
+    - Dataset-specific caching with semantic matching
+    - Cross-dataset pattern learning
+    - In-context few-shot examples for LLMs
+    """
+    
+    def __init__(
+        self,
+        cache_dir: str = ".caafe_cache",
+        dataset_context: Optional[str] = None,
+        dataset_columns: Optional[List[str]] = None
+    ):
+        """
+        Initialize cache with optional dataset-specific storage.
         
-        self.features: List[FeatureEntry] = []
-        self.load_cache()
+        Args:
+            cache_dir: Directory for cache files
+            dataset_context: Description of the dataset
+            dataset_columns: List of column names
+        """
+        self.cache_dir = Path(cache_dir)
+        self.cache_dir.mkdir(exist_ok=True)
+        
+        # Determine cache file
+        if dataset_context and dataset_columns:
+            self.dataset_hash = self._compute_dataset_hash(dataset_context, dataset_columns)
+            self.cache_file = self.cache_dir / f"features_{self.dataset_hash}.json"
+            self.is_dataset_specific = True
+        else:
+            self.cache_file = self.cache_dir / "features_global.json"
+            self.is_dataset_specific = False
+            self.dataset_hash = "global"
+        
+        self.features: List[FeatureMetadata] = []
+        self.load()
     
-    def _generate_dataset_hash(self, dataset_context: str, dataset_columns: List[str]) -> str:
-        """Generate a unique hash for the dataset based on context and columns."""
-        # Create a consistent string representation
-        columns_str = "_".join(sorted(dataset_columns))
-        dataset_signature = f"{dataset_context}_{columns_str}_{len(dataset_columns)}"
+    def _compute_dataset_hash(self, context: str, columns: List[str]) -> str:
+        """Generate a unique hash for dataset identification."""
+        # Normalize and combine dataset identifiers
+        canonical_cols = sorted([col.lower().strip() for col in columns])
+        signature = f"{context.lower().strip()}|{'|'.join(canonical_cols)}"
         
         # Generate short hash
-        hash_obj = hashlib.md5(dataset_signature.encode())
-        return hash_obj.hexdigest()[:8]
+        return hashlib.sha256(signature.encode()).hexdigest()[:12]
+    
+    def _classify_feature_type(self, code: str, description: str) -> str:
+        """Classify the type of feature transformation."""
+        code_lower = code.lower()
+        desc_lower = description.lower()
+        
+        # Check for different feature types
+        if any(op in code for op in ['*', '/', '+', '-']) and code.count('df[') >= 2:
+            if '/' in code:
+                return 'ratio'
+            elif '*' in code:
+                return 'interaction'
+            else:
+                return 'arithmetic'
+        elif 'kmeans' in code_lower or 'dbscan' in code_lower:
+            return 'clustering'
+        elif any(func in code_lower for func in ['log', 'sqrt', 'exp', '**']):
+            return 'mathematical'
+        elif 'groupby' in code_lower or 'transform' in code_lower:
+            return 'aggregation'
+        elif 'pd.cut' in code_lower or 'pd.qcut' in code_lower:
+            return 'binning'
+        elif any(time in desc_lower for time in ['time', 'date', 'hour', 'day', 'month']):
+            return 'temporal'
+        else:
+            return 'other'
+    
+    def _assess_complexity(self, code: str) -> str:
+        """Assess the complexity of the feature code."""
+        lines = [l.strip() for l in code.split('\n') if l.strip() and not l.strip().startswith('#')]
+        
+        if len(lines) == 1:
+            return 'simple'
+        elif len(lines) <= 3:
+            return 'moderate'
+        else:
+            return 'complex'
     
     def add_feature(
         self,
         code: str,
         description: str,
         feature_name: str,
-        improvement_score: float,
-        baseline_score: float,
+        improvement: float,
+        baseline_roc: float,
+        enhanced_roc: float,
         dataset_context: str,
         dataset_size: int,
-        dataset_features: int,
-        tags: Optional[List[str]] = None
-    ) -> FeatureEntry:
-        """Add a new feature to the cache."""
+        dataset_features: int
+    ) -> FeatureMetadata:
+        """
+        Add a validated feature to the cache.
         
-        # Check for duplicates by code hash
-        code_hash = hashlib.md5(code.encode()).hexdigest()[:8]
+        Args:
+            code: Python code that generates the feature
+            description: Human-readable description
+            feature_name: Name of the generated column
+            improvement: ROC-AUC improvement
+            baseline_roc: Baseline model ROC-AUC
+            enhanced_roc: Enhanced model ROC-AUC
+            dataset_context: Dataset description
+            dataset_size: Number of samples
+            dataset_features: Number of features
+            
+        Returns:
+            Created FeatureMetadata object
+        """
+        # Check for duplicates by code similarity
+        code_hash = hashlib.md5(code.encode()).hexdigest()
         for existing in self.features:
-            if existing.code_hash == code_hash:
-                print(f"⚠️  Feature with similar code already exists, updating performance...")
-                # Update if this is a better performance
-                if improvement_score > existing.improvement_score:
+            existing_hash = hashlib.md5(existing.code.encode()).hexdigest()
+            if existing_hash == code_hash:
+                # Update if this version performed better
+                if improvement > existing.improvement:
                     self.features.remove(existing)
                     break
                 else:
                     return existing
         
-        feature = FeatureEntry(
+        # Create metadata
+        metadata = FeatureMetadata(
             code=code,
             description=description,
             feature_name=feature_name,
-            improvement_score=improvement_score,
-            baseline_score=baseline_score,
+            improvement=improvement,
+            baseline_roc=baseline_roc,
+            enhanced_roc=enhanced_roc,
+            dataset_hash=self.dataset_hash,
             dataset_context=dataset_context,
             dataset_size=dataset_size,
             dataset_features=dataset_features,
-            tags=tags
+            timestamp=datetime.now().isoformat(),
+            feature_type=self._classify_feature_type(code, description),
+            complexity=self._assess_complexity(code)
         )
         
-        self.features.append(feature)
-        self.save_cache()
+        self.features.append(metadata)
+        self.save()
         
-        print(f"💾 Cached feature '{feature_name}' with {improvement_score:+.4f} improvement ({feature.success_rank})")
-        return feature
+        return metadata
     
-    def get_successful_features(
+    def get_relevant_features(
         self,
-        min_improvement: float = 0.001,
-        success_ranks: Optional[List[str]] = None,
-        dataset_context: Optional[str] = None,
-        limit: int = 10
-    ) -> List[FeatureEntry]:
-        """Get successful features matching criteria."""
+        dataset_context: str,
+        baseline_roc: float,
+        limit: int = 5,
+        min_impact: float = 0.5
+    ) -> List[FeatureMetadata]:
+        """
+        Get features relevant to the current problem.
         
-        filtered = []
+        Args:
+            dataset_context: Current dataset description
+            baseline_roc: Current baseline performance
+            limit: Maximum features to return
+            min_impact: Minimum impact score
+            
+        Returns:
+            List of relevant features sorted by impact
+        """
+        relevant = []
+        context_words = set(dataset_context.lower().split())
+        
         for feature in self.features:
-            # Filter by improvement threshold
-            if feature.improvement_score < min_improvement:
+            # Skip low-impact features
+            if feature.impact_score < min_impact:
                 continue
             
-            # Filter by success rank
-            if success_ranks and feature.success_rank not in success_ranks:
-                continue
+            # Calculate relevance score
+            relevance = 0.0
             
-            # Filter by dataset context (fuzzy matching)
-            if dataset_context:
-                context_lower = dataset_context.lower()
-                feature_context_lower = feature.dataset_context.lower()
-                
-                # Check for common keywords
-                context_keywords = set(context_lower.split())
-                feature_keywords = set(feature_context_lower.split())
-                
-                if not context_keywords.intersection(feature_keywords):
-                    continue
+            # Semantic similarity
+            feature_words = set(feature.dataset_context.lower().split())
+            overlap = len(context_words & feature_words) / max(len(context_words), 1)
+            relevance += overlap * 0.3
             
-            filtered.append(feature)
+            # Similar baseline performance (features that worked at similar difficulty)
+            baseline_diff = abs(feature.baseline_roc - baseline_roc)
+            if baseline_diff < 0.1:
+                relevance += 0.3
+            elif baseline_diff < 0.2:
+                relevance += 0.1
+            
+            # Impact score contribution
+            relevance += min(feature.impact_score / 10, 0.4)
+            
+            if relevance > 0.2:  # Minimum relevance threshold
+                relevant.append((relevance, feature))
         
-        # Sort by improvement score (descending)
-        filtered.sort(key=lambda x: x.improvement_score, reverse=True)
-        
-        return filtered[:limit]
+        # Sort by relevance and return top features
+        relevant.sort(key=lambda x: x[0], reverse=True)
+        return [f[1] for f in relevant[:limit]]
     
-    def get_top_universal_features(self, top_n: int = 5) -> List[FeatureEntry]:
-        """Get the most universally successful features across different datasets."""
+    def get_feature_patterns(self) -> Dict[str, List[str]]:
+        """
+        Extract successful patterns grouped by type.
         
-        # Group features by code similarity and take the best performer
-        feature_groups = {}
+        Returns:
+            Dictionary mapping feature types to example descriptions
+        """
+        patterns = {}
+        
+        # Group by feature type
         for feature in self.features:
-            # Simple grouping by first few words of description
-            group_key = ' '.join(feature.description.split()[:3]).lower()
-            
-            if group_key not in feature_groups:
-                feature_groups[group_key] = feature
-            elif feature.improvement_score > feature_groups[group_key].improvement_score:
-                feature_groups[group_key] = feature
+            if feature.impact_score > 1.0:  # Only successful features
+                if feature.feature_type not in patterns:
+                    patterns[feature.feature_type] = []
+                
+                # Add unique patterns
+                pattern_desc = f"{feature.description} (Δ={feature.improvement:.3f})"
+                if pattern_desc not in patterns[feature.feature_type]:
+                    patterns[feature.feature_type].append(pattern_desc)
         
-        # Sort by improvement and return top N
-        top_features = sorted(feature_groups.values(), 
-                            key=lambda x: x.improvement_score, reverse=True)
-        
-        return top_features[:top_n]
-    
-    def get_feature_patterns(self, min_success_rank: str = "good") -> Dict[str, List[str]]:
-        """Extract common patterns from successful features."""
-        
-        rank_order = ["minimal", "moderate", "good", "excellent", "exceptional"]
-        min_rank_idx = rank_order.index(min_success_rank)
-        
-        patterns = {
-            "interaction_features": [],
-            "mathematical_transforms": [],
-            "aggregation_features": [],
-            "time_features": [],
-            "ratio_features": []
-        }
-        
-        for feature in self.features:
-            if rank_order.index(feature.success_rank) < min_rank_idx:
-                continue
-            
-            code_lower = feature.code.lower()
-            desc_lower = feature.description.lower()
-            
-            # Categorize feature types
-            if "*" in feature.code or "interaction" in desc_lower:
-                patterns["interaction_features"].append(feature.description)
-            
-            if any(op in code_lower for op in ["log", "sqrt", "**", "^"]):
-                patterns["mathematical_transforms"].append(feature.description)
-            
-            if any(agg in code_lower for agg in ["groupby", "transform", "mean", "sum", "count"]):
-                patterns["aggregation_features"].append(feature.description)
-            
-            if any(time_word in desc_lower for time_word in ["time", "hour", "day", "temporal"]):
-                patterns["time_features"].append(feature.description)
-            
-            if "/" in feature.code or "ratio" in desc_lower:
-                patterns["ratio_features"].append(feature.description)
+        # Limit to top 3 per type
+        for feat_type in patterns:
+            patterns[feat_type] = patterns[feat_type][:3]
         
         return patterns
     
-    def generate_intelligent_prompt_addition(self, dataset_context: str, current_dataset_features: List[str] = None) -> str:
-        """Generate enhanced prompt content based on cached features and avoid repetition."""
+    def generate_prompt_context(
+        self,
+        dataset_context: str,
+        baseline_roc: float,
+        current_features: List[str]
+    ) -> str:
+        """
+        Generate context for LLM prompt based on cached knowledge.
         
-        if not self.features:
-            return ""
-        
-        # Separate current dataset features from other datasets
-        current_dataset_features_cache = [f for f in self.features if f.dataset_context == dataset_context]
-        other_dataset_features = [f for f in self.features if f.dataset_context != dataset_context and f.improvement_score > 0.001]
-        
-        prompt_addition = "\n**🧠 INTELLIGENT CACHE GUIDANCE:**\n"
-        
-        # 1. Features already generated for THIS exact dataset
-        if current_dataset_features_cache:
-            prompt_addition += "**ALREADY GENERATED FOR THIS DATASET (DO NOT REPEAT):**\n"
-            for feature in current_dataset_features_cache:
-                feature_code = feature.code.split('\n')[-1]  # Get the actual code line
-                prompt_addition += f"❌ AVOID: {feature.feature_name} = {feature_code}\n"
-                prompt_addition += f"   (Already tested, improvement: {feature.improvement_score:+.4f})\n"
-            prompt_addition += "\n**❗ CRITICAL: Do NOT generate any variation of the above features. They have already been tested.**\n\n"
-        
-        # 2. Successful patterns from other similar datasets (inspiration)
-        if other_dataset_features:
-            prompt_addition += "**SUCCESSFUL PATTERNS FROM OTHER DATASETS (for inspiration):**\n"
-            unique_patterns = {}
-            for feature in other_dataset_features[:5]:
-                pattern_key = feature.feature_name.lower().replace('_', ' ')
-                if pattern_key not in unique_patterns:
-                    unique_patterns[pattern_key] = feature
+        Args:
+            dataset_context: Current dataset description
+            baseline_roc: Current baseline performance
+            current_features: Already generated feature names
             
-            for feature in list(unique_patterns.values())[:3]:
-                prompt_addition += f"✅ Pattern: {feature.description}\n"
-                prompt_addition += f"   Type: {self._categorize_feature_type(feature)}\n"
-                prompt_addition += f"   Improvement: {feature.improvement_score:+.4f}\n\n"
+        Returns:
+            Formatted prompt context
+        """
+        context_parts = []
         
-        # 3. Suggested new directions
-        attempted_types = [self._categorize_feature_type(f) for f in current_dataset_features_cache]
-        untried_types = [t for t in ["interaction", "ratio", "aggregation", "mathematical", "binning"] if t not in attempted_types]
+        # Get relevant successful features
+        relevant = self.get_relevant_features(dataset_context, baseline_roc, limit=3)
         
-        if untried_types:
-            prompt_addition += f"**SUGGESTED NEW DIRECTIONS (not yet tried):**\n"
-            for feat_type in untried_types[:3]:
-                prompt_addition += f"💡 Try {feat_type} features\n"
-            prompt_addition += "\n"
+        if relevant:
+            context_parts.append("## Successful Patterns from Similar Problems\n")
+            for i, feature in enumerate(relevant, 1):
+                context_parts.append(
+                    f"{i}. **{feature.feature_type.title()}**: {feature.description}\n"
+                    f"   - Impact: {feature.relative_improvement:.1f}% relative improvement\n"
+                    f"   - Baseline: {feature.baseline_roc:.3f} → {feature.enhanced_roc:.3f}\n"
+                )
         
-        prompt_addition += "**🎯 YOUR TASK: Generate a NEW type of feature that hasn't been tried yet on this dataset.**\n"
+        # Add pattern summary if available
+        patterns = self.get_feature_patterns()
+        if patterns:
+            context_parts.append("\n## Proven Feature Types\n")
+            for feat_type, examples in patterns.items():
+                if examples:
+                    context_parts.append(f"- **{feat_type.title()}**: {examples[0]}\n")
         
-        return prompt_addition
+        # Add guidance to avoid repetition
+        if current_features:
+            context_parts.append(f"\n## Already Generated (Do Not Repeat)\n")
+            for feat in current_features[:5]:  # Show recent 5
+                context_parts.append(f"- {feat}\n")
+        
+        return "".join(context_parts)
     
-    def _categorize_feature_type(self, feature: FeatureEntry) -> str:
-        """Categorize a feature by its type for better guidance."""
-        code_lower = feature.code.lower()
-        desc_lower = feature.description.lower()
-        
-        if "+" in feature.code and any(x in desc_lower for x in ["family", "total", "sum"]):
-            return "aggregation"
-        elif "*" in feature.code or "interaction" in desc_lower:
-            return "interaction"
-        elif "/" in feature.code or "ratio" in desc_lower:
-            return "ratio"
-        elif any(op in code_lower for op in ["log", "sqrt", "**", "exp"]):
-            return "mathematical"
-        elif any(op in code_lower for op in ["cut", "qcut", "bin"]):
-            return "binning"
-        elif any(op in code_lower for op in ["groupby", "transform"]):
-            return "grouping"
-        else:
-            return "other"
-    
-    def save_cache(self):
-        """Save cache to JSON file with atomic write."""
+    def save(self) -> None:
+        """Atomically save cache to disk."""
         cache_data = {
-            'version': '1.0',
-            'created': datetime.now().isoformat(),
-            'features': [feature.to_dict() for feature in self.features]
+            'version': '2.0',
+            'dataset_hash': self.dataset_hash,
+            'updated': datetime.now().isoformat(),
+            'features': [f.to_dict() for f in self.features]
         }
         
+        # Write to temporary file first
+        temp_fd, temp_path = tempfile.mkstemp(dir=self.cache_dir, suffix='.tmp')
         try:
-            # [FIX] Atomic write to prevent corruption during parallel runs
-            cache_dir = self.cache_file.parent if hasattr(self.cache_file, 'parent') else os.path.dirname(self.cache_file)
-            with NamedTemporaryFile('w', delete=False, dir=cache_dir, suffix='.tmp') as tmp:
-                json.dump(cache_data, tmp, indent=2)
-                tmp.flush()
-                os.fsync(tmp.fileno())
-                temp_path = tmp.name
+            with os.fdopen(temp_fd, 'w') as f:
+                json.dump(cache_data, f, indent=2)
             
-            # Atomic move
+            # Atomic rename
             os.replace(temp_path, self.cache_file)
-        except Exception as e:
-            print(f"⚠️  Failed to save feature cache: {e}")
-            # Clean up temp file if it exists
-            try:
-                if 'temp_path' in locals():
-                    os.unlink(temp_path)
-            except:
-                pass
+        except Exception:
+            # Clean up temp file on error
+            if os.path.exists(temp_path):
+                os.unlink(temp_path)
+            raise
     
-    def load_cache(self):
-        """Load cache from JSON file."""
+    def load(self) -> None:
+        """Load cache from disk."""
         if not self.cache_file.exists():
-            print(f"📂 No existing cache found, starting fresh: {self.cache_file}")
             return
         
         try:
@@ -374,71 +380,38 @@ class FeatureCache:
                 cache_data = json.load(f)
             
             self.features = [
-                FeatureEntry.from_dict(feature_data) 
-                for feature_data in cache_data.get('features', [])
+                FeatureMetadata.from_dict(f) 
+                for f in cache_data.get('features', [])
             ]
-            
-            print(f"📂 Loaded {len(self.features)} cached features from {self.cache_file}")
-            
-            # Print summary
-            if self.features:
-                success_counts = {}
-                for feature in self.features:
-                    success_counts[feature.success_rank] = success_counts.get(feature.success_rank, 0) + 1
-                
-                print(f"   Cache summary: {dict(success_counts)}")
-                
         except Exception as e:
-            print(f"⚠️  Failed to load feature cache: {e}")
+            print(f"Warning: Failed to load cache: {e}")
             self.features = []
     
-    def get_cache_stats(self) -> Dict:
-        """Get statistics about the cache."""
+    def get_statistics(self) -> dict:
+        """Get cache statistics."""
         if not self.features:
-            return {"total_features": 0}
+            return {
+                'total_features': 0,
+                'datasets': 0,
+                'avg_improvement': 0,
+                'best_improvement': 0,
+                'feature_types': {}
+            }
         
-        improvements = [f.improvement_score for f in self.features]
-        success_ranks = [f.success_rank for f in self.features]
+        # Compute statistics
+        improvements = [f.improvement for f in self.features]
+        datasets = len(set(f.dataset_hash for f in self.features))
+        
+        # Count feature types
+        type_counts = {}
+        for f in self.features:
+            type_counts[f.feature_type] = type_counts.get(f.feature_type, 0) + 1
         
         return {
-            "total_features": len(self.features),
-            "avg_improvement": np.mean(improvements),
-            "best_improvement": max(improvements),
-            "success_distribution": {rank: success_ranks.count(rank) for rank in set(success_ranks)},
-            "dataset_contexts": list(set(f.dataset_context for f in self.features))
+            'total_features': len(self.features),
+            'datasets': datasets,
+            'avg_improvement': np.mean(improvements),
+            'best_improvement': max(improvements),
+            'avg_impact_score': np.mean([f.impact_score for f in self.features]),
+            'feature_types': type_counts
         }
-    
-    def export_best_features(self, output_file: str = "best_features.py", min_rank: str = "good"):
-        """Export the best features as a Python module for easy reuse."""
-        
-        rank_order = ["minimal", "moderate", "good", "excellent", "exceptional"]
-        min_rank_idx = rank_order.index(min_rank)
-        
-        best_features = [
-            f for f in self.features 
-            if rank_order.index(f.success_rank) >= min_rank_idx
-        ]
-        
-        best_features.sort(key=lambda x: x.improvement_score, reverse=True)
-        
-        with open(output_file, 'w') as f:
-            f.write('"""\nCAFE Best Features Library\n')
-            f.write(f'Generated on {datetime.now().isoformat()}\n')
-            f.write(f'Contains {len(best_features)} high-performing features\n"""\n\n')
-            f.write('import pandas as pd\nimport numpy as np\n\n')
-            
-            for i, feature in enumerate(best_features):
-                f.write(f'def feature_{i+1}_{feature.feature_name.replace(" ", "_")}(df):\n')
-                f.write(f'    """\n    {feature.description}\n')
-                f.write(f'    Improvement: {feature.improvement_score:+.4f} ({feature.success_rank})\n')
-                f.write(f'    Dataset: {feature.dataset_context}\n    """\n')
-                
-                # Clean up the code for function format
-                code_lines = feature.code.strip().split('\n')
-                for line in code_lines:
-                    if line.strip() and not line.strip().startswith('#'):
-                        f.write(f'    {line}\n')
-                
-                f.write(f'    return df\n\n')
-        
-        print(f"📄 Exported {len(best_features)} best features to {output_file}")

@@ -70,12 +70,11 @@ Thumbs.db
 *.key
 api_keys.txt
 
-# Data
-data/
-*.csv
+# Large data files (keep sample data)
 *.parquet
 *.pkl
 *.pickle
+large_data/
 
 # Logs
 *.log

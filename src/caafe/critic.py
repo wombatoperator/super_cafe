@@ -1,128 +1,283 @@
+"""
+SUPER CAAFE Critic: Deterministic, High-Performance Feature Validation
+=====================================================================
 
-from __future__ import annotations
+A stateless, deterministic XGBoost critic that provides consistent evaluation
+signals for feature engineering decisions. Designed for speed and reproducibility.
+"""
 
-from dataclasses import dataclass, field
-from typing import Tuple
-
+from typing import Tuple, Optional
 import numpy as np
 import pandas as pd
-from sklearn.metrics import roc_auc_score
-from sklearn.model_selection import train_test_split, RepeatedStratifiedKFold
-
-from sklearn.linear_model import LogisticRegression
-
-def _clean_df(df: pd.DataFrame) -> pd.DataFrame:
-    """[OPTIMIZED] Batch numeric processing for 2-3x speedup."""
-    clean = df.copy()
-    
-    # [OPTIMIZATION] Batch-fill numeric medians for 2-3x speedup
-    numeric_cols = clean.select_dtypes(include=[np.number]).columns
-    if len(numeric_cols) > 0:
-        clean[numeric_cols] = clean[numeric_cols].fillna(clean[numeric_cols].median())
-    
-    # Process categorical columns
-    categorical_cols = clean.select_dtypes(exclude=[np.number]).columns
-    for c in categorical_cols:
-        # This maps NaNs to a new category (0), which is more robust
-        # than collapsing them with the first category.
-        clean[c] = pd.Categorical(clean[c]).codes + 1
-    
-    return clean.astype(np.float32)
+from sklearn.model_selection import StratifiedKFold, cross_val_score
+from sklearn.preprocessing import LabelEncoder
+from sklearn.base import clone
+from xgboost import XGBClassifier
 
 
-def _clean_target(y: pd.Series) -> pd.Series:
-    """[ROBUST] Cleans the target variable and ensures it is binary."""
-    y = y.dropna()
-    codes, _ = pd.factorize(y, sort=True)
-    if codes.max() > 1:
-        raise ValueError("Critic expects a binary target (0/1) after cleaning.")
-    return pd.Series(codes, index=y.index, name=y.name)
-
-
-
-@dataclass(slots=True)
 class Critic:
-    """ROC-AUC scorer based on a fixed, tuned LogisticRegression model."""
-    folds: int = 3
-    repeats: int = 2  
-    holdout: float | None = None
-    n_jobs: int = -1  # Use all available CPU cores by default
-    seed: int = 42
-
-    _model: LogisticRegression = field(init=False, repr=False)
-    fold_scores: list = field(init=False, repr=False, default_factory=list)
-
-    def __post_init__(self) -> None:
-        if self.holdout is not None:
-            assert 0 < self.holdout < 1, "holdout must be between 0 and 1"
-        
-        # [OPTIMIZED] Using LogisticRegression for deterministic results
-        self._model = LogisticRegression(
-            max_iter=200,
-            solver="lbfgs",
-            n_jobs=1,  # LR doesn't benefit much from parallelism
-            random_state=self.seed
-        )
-        print(f"✅ LogisticRegression critic ready — folds={self.folds}, deterministic")
-
-    def score(self, X: pd.DataFrame, y: pd.Series) -> float:
-        """Cleans data and returns the out-of-sample ROC AUC score."""
-        y_bin = _clean_target(y)
-        # [FIX] Re-index once, not twice - inline indexing after target_clean
-        X_sync = _clean_df(X.loc[y_bin.index])
-
-        # [FIX] Use local holdout_ratio instead of mutating instance
-        holdout_ratio = None
-        
-        # Auto-switch to holdout for large datasets (≥10k rows)
-        if len(X_sync) >= 10000:
-            holdout_ratio = 0.2
-            return self._holdout_auc(X_sync, y_bin, holdout_ratio)
-        elif self.holdout:
-            return self._holdout_auc(X_sync, y_bin, self.holdout)
-        return self._cv_auc(X_sync, y_bin)
-
-    def score_delta(self, X: pd.DataFrame, y: pd.Series, baseline_auc: float) -> float:
-        """Calculates the performance improvement over a baseline."""
-        return self.score(X, y) - baseline_auc
-
-    def _cv_auc(self, X: pd.DataFrame, y: pd.Series) -> float:
-        """[STABILITY] Uses RepeatedStratifiedKFold for more robust evaluation."""
-        cv = RepeatedStratifiedKFold(n_splits=self.folds, n_repeats=self.repeats, random_state=self.seed)
-        X_np, y_np = X.values, y.values
-        oof_preds = np.zeros_like(y_np, dtype=float)
-        self.fold_scores = []
-
-        for train_idx, test_idx in cv.split(X_np, y_np):
-            X_train, X_test = X_np[train_idx], X_np[test_idx]
-            y_train, y_test = y_np[train_idx], y_np[test_idx]
-            
-            # [FIX] Clone the model for every CV fold to prevent leakage
-            fresh_model = self._model.__class__(**self._get_model_params())
-            fresh_model.fit(X_train, y_train)
-            probas = fresh_model.predict_proba(X_test)[:, 1]
-            oof_preds[test_idx] = probas
-            self.fold_scores.append(roc_auc_score(y_test, probas))
-
-        return roc_auc_score(y_np, oof_preds)
-
-    def _holdout_auc(self, X: pd.DataFrame, y: pd.Series, holdout_ratio: float) -> float:
-        """Calculates ROC AUC on a single train-test split."""
-        X_train, X_test, y_train, y_test = train_test_split(
-            X.values, y.values, test_size=holdout_ratio, random_state=self.seed, stratify=y.values
-        )
-        # [FIX] Clone model for hold-out confirmation
-        fresh_model = self._model.__class__(**self._get_model_params())
-        fresh_model.fit(X_train, y_train)
-        prob = fresh_model.predict_proba(X_test)[:, 1]
-        self.fold_scores = [roc_auc_score(y_test, prob)] # Keep API consistent
-        return self.fold_scores[0]
+    """
+    Deterministic XGBoost-based feature evaluator.
     
-    def _get_model_params(self) -> dict:
-        """Get model parameters for cloning."""
-        return {
-            'max_iter': self._model.max_iter,
-            'solver': self._model.solver,
-            'n_jobs': self._model.n_jobs,
-            'random_state': self._model.random_state
+    Key principles:
+    - Complete statelessness: fresh models for every evaluation
+    - Deterministic results: fixed seeds and single-threaded execution
+    - Fast evaluation: 'hist' tree method for speed
+    - Proper data handling: consistent encoding and imputation
+    """
+    
+    def __init__(
+        self,
+        n_folds: int = 3,
+        epsilon: float = 0.001,
+        adaptive_epsilon: bool = True,
+        random_state: int = 42
+    ):
+        """
+        Initialize the critic with evaluation parameters.
+        
+        Args:
+            n_folds: Number of cross-validation folds
+            epsilon: Minimum improvement threshold (adaptive if enabled)
+            adaptive_epsilon: Whether to adjust epsilon based on baseline performance
+            random_state: Seed for reproducibility
+        """
+        self.n_folds = n_folds
+        self.epsilon = epsilon
+        self.adaptive_epsilon = adaptive_epsilon
+        self.random_state = random_state
+        
+        # Fixed XGBoost parameters for speed and determinism
+        self.model_params = {
+            'tree_method': 'hist',  # Fast histogram-based method
+            'n_estimators': 50,     # Reduced for speed
+            'max_depth': 3,         # Shallow trees for generalization
+            'learning_rate': 0.3,   # Higher LR with fewer trees
+            'subsample': 0.8,
+            'colsample_bytree': 0.8,
+            'min_child_weight': 5,
+            'gamma': 2.0,
+            'random_state': random_state,
+            'n_jobs': 1,            # Single thread for determinism
+            'verbosity': 0,
+            'eval_metric': 'auc',
+            'use_label_encoder': False
         }
+        
+    def _prepare_data(self, X: pd.DataFrame, y: pd.Series) -> Tuple[np.ndarray, np.ndarray]:
+        """
+        Prepare data for XGBoost with consistent encoding and imputation.
+        
+        Args:
+            X: Feature dataframe
+            y: Target series
+            
+        Returns:
+            Tuple of (prepared features, encoded target)
+        """
+        # Create a copy to avoid modifying original
+        X_prep = X.copy()
+        
+        # Handle numeric columns
+        numeric_cols = X_prep.select_dtypes(include=[np.number]).columns
+        if len(numeric_cols) > 0:
+            # Vectorized median imputation
+            medians = X_prep[numeric_cols].median()
+            X_prep[numeric_cols] = X_prep[numeric_cols].fillna(medians)
+        
+        # Handle categorical columns
+        categorical_cols = X_prep.select_dtypes(include=['object', 'category']).columns
+        for col in categorical_cols:
+            # Simple ordinal encoding with NaN handling
+            X_prep[col] = pd.Categorical(X_prep[col]).codes + 1  # +1 to reserve 0 for NaN
+            
+        # Ensure all values are float32 for XGBoost
+        X_prep = X_prep.astype(np.float32)
+        
+        # Encode target if necessary
+        if y.dtype == 'object' or y.dtype.name == 'category':
+            le = LabelEncoder()
+            y_encoded = le.fit_transform(y)
+            # Verify binary classification
+            if len(np.unique(y_encoded)) > 2:
+                raise ValueError("Critic only supports binary classification")
+        else:
+            y_encoded = y.values
+            
+        return X_prep.values, y_encoded
+    
+    def get_epsilon(self, baseline_score: float) -> float:
+        """
+        Get adaptive epsilon threshold based on baseline performance.
+        
+        Implements the insight from SUPER CAAFE: harder to improve strong baselines.
+        
+        Args:
+            baseline_score: Current model's ROC-AUC
+            
+        Returns:
+            Adjusted epsilon threshold
+        """
+        if not self.adaptive_epsilon:
+            return self.epsilon
+            
+        if baseline_score < 0.6:
+            return 0.01    # 1% for random-level baselines
+        elif baseline_score < 0.7:
+            return 0.005   # 0.5% for weak baselines
+        elif baseline_score < 0.85:
+            return 0.002   # 0.2% for moderate baselines
+        elif baseline_score < 0.95:
+            return 0.001   # 0.1% for strong baselines
+        else:
+            return 0.0005  # 0.05% for very strong baselines
+    
+    def evaluate(self, X: pd.DataFrame, y: pd.Series) -> Tuple[float, float]:
+        """
+        Evaluate features using stratified k-fold cross-validation.
+        
+        Args:
+            X: Feature dataframe
+            y: Target series
+            
+        Returns:
+            Tuple of (mean ROC-AUC, standard deviation)
+        """
+        # Prepare data
+        X_prep, y_prep = self._prepare_data(X, y)
+        
+        # Create fresh model instance
+        model = XGBClassifier(**self.model_params)
+        
+        # Stratified K-Fold with fixed random state
+        cv = StratifiedKFold(
+            n_splits=self.n_folds,
+            shuffle=True,
+            random_state=self.random_state
+        )
+        
+        # Get cross-validation scores
+        scores = cross_val_score(
+            estimator=model,
+            X=X_prep,
+            y=y_prep,
+            cv=cv,
+            scoring='roc_auc',
+            n_jobs=1  # Ensure determinism
+        )
+        
+        return float(scores.mean()), float(scores.std())
+    
+    def should_accept_feature(
+        self,
+        baseline_score: float,
+        new_score: float,
+        baseline_std: float = 0.0,
+        new_std: float = 0.0
+    ) -> Tuple[bool, float, str]:
+        """
+        Determine if a feature should be accepted based on improvement.
+        
+        Args:
+            baseline_score: ROC-AUC without the feature
+            new_score: ROC-AUC with the feature
+            baseline_std: Standard deviation of baseline
+            new_std: Standard deviation with feature
+            
+        Returns:
+            Tuple of (accept decision, improvement, reason)
+        """
+        improvement = new_score - baseline_score
+        epsilon = self.get_epsilon(baseline_score)
+        
+        # Accept if improvement exceeds threshold
+        if improvement > epsilon:
+            reason = f"Improvement {improvement:.4f} > ε={epsilon:.4f}"
+            return True, improvement, reason
+        
+        # Reject if performance degrades
+        elif improvement < -epsilon/2:  # More tolerant of small decreases
+            reason = f"Performance degraded by {-improvement:.4f}"
+            return False, improvement, reason
+        
+        # Reject if no meaningful change
+        else:
+            reason = f"Improvement {improvement:.4f} ≤ ε={epsilon:.4f}"
+            return False, improvement, reason
+    
+    def evaluate_delta(
+        self,
+        X_baseline: pd.DataFrame,
+        X_enhanced: pd.DataFrame,
+        y: pd.Series
+    ) -> Tuple[bool, float, dict]:
+        """
+        Evaluate whether enhanced features improve over baseline.
+        
+        Args:
+            X_baseline: Original features
+            X_enhanced: Features with additions
+            y: Target variable
+            
+        Returns:
+            Tuple of (accept, improvement, metrics_dict)
+        """
+        # Evaluate baseline
+        baseline_mean, baseline_std = self.evaluate(X_baseline, y)
+        
+        # Evaluate enhanced
+        enhanced_mean, enhanced_std = self.evaluate(X_enhanced, y)
+        
+        # Make acceptance decision
+        accept, improvement, reason = self.should_accept_feature(
+            baseline_mean, enhanced_mean, baseline_std, enhanced_std
+        )
+        
+        # Compile metrics
+        metrics = {
+            'baseline_roc': baseline_mean,
+            'baseline_std': baseline_std,
+            'enhanced_roc': enhanced_mean,
+            'enhanced_std': enhanced_std,
+            'improvement': improvement,
+            'relative_improvement': improvement / baseline_mean if baseline_mean > 0 else 0,
+            'epsilon': self.get_epsilon(baseline_mean),
+            'accept': accept,
+            'reason': reason
+        }
+        
+        return accept, improvement, metrics
+    
+    def validate_holdout(
+        self,
+        X_train: pd.DataFrame,
+        y_train: pd.Series,
+        X_holdout: pd.DataFrame,
+        y_holdout: pd.Series
+    ) -> float:
+        """
+        Train on full training set and evaluate on holdout.
+        
+        Args:
+            X_train: Training features
+            y_train: Training target
+            X_holdout: Holdout features
+            y_holdout: Holdout target
+            
+        Returns:
+            ROC-AUC score on holdout set
+        """
+        # Prepare data
+        X_train_prep, y_train_prep = self._prepare_data(X_train, y_train)
+        X_holdout_prep, y_holdout_prep = self._prepare_data(X_holdout, y_holdout)
+        
+        # Create fresh model and train
+        model = XGBClassifier(**self.model_params)
+        model.fit(X_train_prep, y_train_prep)
+        
+        # Predict probabilities
+        y_pred_proba = model.predict_proba(X_holdout_prep)[:, 1]
+        
+        # Calculate ROC-AUC
+        from sklearn.metrics import roc_auc_score
+        return float(roc_auc_score(y_holdout_prep, y_pred_proba))
