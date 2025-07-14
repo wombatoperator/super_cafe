@@ -832,11 +832,25 @@ class SuperCAAFE:
         self,
         X: pd.DataFrame,
         y: pd.Series,
-        dataset_context: str = ""
+        dataset_context: str = "",
+        dataset_columns: Optional[List[str]] = None
     ) -> pd.DataFrame:
         """Apply the best cached features to a dataset."""
-        # Initialize cache
-        cache = FeatureCache(self.cache_dir)
+        # Use dataset columns from DataFrame if not provided
+        if dataset_columns is None:
+            dataset_columns = list(X.columns)
+        
+        # Initialize cache with dataset-specific mode if context/columns provided
+        if dataset_context and dataset_columns:
+            cache = FeatureCache(
+                cache_dir=self.cache_dir,
+                dataset_context=dataset_context,
+                dataset_columns=dataset_columns
+            )
+            # Merge with global cache for cross-dataset learning
+            cache.merge_with_global_cache()
+        else:
+            cache = FeatureCache(self.cache_dir)
         
         # Get baseline for reference
         baseline, _ = self.critic.evaluate(X, y)

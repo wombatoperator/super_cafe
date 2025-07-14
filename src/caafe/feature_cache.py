@@ -387,6 +387,42 @@ class FeatureCache:
             print(f"Warning: Failed to load cache: {e}")
             self.features = []
     
+    def merge_with_global_cache(self) -> None:
+        """
+        Merge the current cache with the global cache to access cross-dataset features.
+        
+        This method loads features from the global cache and adds them to the current
+        cache instance for enhanced feature retrieval. Features from the dataset-specific
+        cache take precedence over global cache features with the same code.
+        """
+        if not self.is_dataset_specific:
+            return  # Already using global cache
+        
+        global_cache_file = self.cache_dir / "features_global.json"
+        if not global_cache_file.exists():
+            return
+        
+        try:
+            with open(global_cache_file, 'r') as f:
+                global_cache_data = json.load(f)
+            
+            global_features = [
+                FeatureMetadata.from_dict(f) 
+                for f in global_cache_data.get('features', [])
+            ]
+            
+            # Create set of existing codes to avoid duplicates
+            existing_codes = {hashlib.md5(f.code.encode()).hexdigest() for f in self.features}
+            
+            # Add global features that don't already exist
+            for global_feature in global_features:
+                global_code_hash = hashlib.md5(global_feature.code.encode()).hexdigest()
+                if global_code_hash not in existing_codes:
+                    self.features.append(global_feature)
+            
+        except Exception as e:
+            print(f"Warning: Failed to merge with global cache: {e}")
+    
     def get_statistics(self) -> dict:
         """Get cache statistics."""
         if not self.features:
