@@ -104,4 +104,4 @@ output/
 
 # Experiment artifacts
 experiments/output/
-experiments/cache/
+experiments/cache/.caafe_cache/
